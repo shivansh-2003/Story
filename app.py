@@ -2,9 +2,12 @@ import openai
 import streamlit as st
 from fpdf import FPDF
 import base64
+from gtts import gTTS
+import os
 
 # Set your OpenAI API key
 openai.api_key = ''
+
 # Define the prompt template for story generation
 prompt_template = """
 You are the narrator of an interactive story. The story starts with:
@@ -43,6 +46,12 @@ def convert_to_pdf(story_parts):
         pdf.multi_cell(0, 10, part)
 
     return pdf
+
+def convert_to_audio(story, language='en'):
+    tts = gTTS(text=story, lang=language, slow=False)
+    audio_file = "story_audio.mp3"
+    tts.save(audio_file)
+    return audio_file
 
 def main():
     st.title("Interactive Storytelling App")
@@ -93,6 +102,17 @@ def main():
                 pdf_output = pdf.output(dest='S').encode('latin1')
                 b64_pdf = base64.b64encode(pdf_output).decode('latin1')
                 href = f'<a href="data:application/octet-stream;base64,{b64_pdf}" download="story.pdf">Download PDF</a>'
+                st.markdown(href, unsafe_allow_html=True)
+
+            language_option = st.selectbox("Choose a language for the audio:", ["English","Spanish", "French", "Chinese"])
+            lang_dict = {"English": "en", "Hindi": "hi", "Spanish": "es", "French": "fr", "Chinese": "zh"}
+
+            if st.button("Convert to Audio"):
+                selected_lang = lang_dict[language_option]
+                audio_file = convert_to_audio(" ".join(st.session_state.story), language=selected_lang)
+                with open(audio_file, "rb") as audio:
+                    b64_audio = base64.b64encode(audio.read()).decode('latin1')
+                href = f'<a href="data:audio/mp3;base64,{b64_audio}" download="story_audio.mp3">Download Audio</a>'
                 st.markdown(href, unsafe_allow_html=True)
 
 if __name__ == "__main__":
