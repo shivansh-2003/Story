@@ -1,0 +1,48 @@
+:root {
+  /* the desk — dark chrome that frames the page */
+  --ink-black: #1c1a17;
+  --panel: #242019;
+  --panel-raised: #2c2720;
+  --panel-border: #3c362b;
+
+  /* the page — lamp-lit paper, the one bright surface in the room */
+  --paper: #f3ead9;
+  --paper-shadow: #e7dabf;
+  --ink: #2b2118;
+  --ink-muted: #6b5c48;
+
+  /* the lamp — primary accent, warm brass */
+  --brass: #c98a34;
+  --brass-bright: #e0a04a;
+  --brass-dim: #8a611f;
+
+  /* the pencil — provisional, not-yet-accepted AI text */
+  --pencil: #64707c;
+  --pencil-bright: #8894a0;
+  --pencil-wash: #dfe0da;
+
+  /* text on the dark chrome */
+  --cream: #ece5d8;
+  --cream-muted: #a89e8c;
+  --cream-faint: #6f6656;
+
+  --danger: #c1594c;
+  --danger-bg: #3a2620;
+
+  --font-display: "Fraunces", "Iowan Old Style", serif;
+  --font-manuscript: "Source Serif 4", "Iowan Old Style", Georgia, serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", monospace;
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-12: 3rem;
+
+  --radius-sm: 3px;
+  --radius-md: 6px;
+
+  --shadow-page: 0 1px 2px rgba(0, 0, 0, 0.4), 0 20px 48px -20px rgba(0, 0, 0, 0.7);
+}

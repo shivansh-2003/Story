@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]>=2.0
+asyncpg
+pydantic-settings
+email-validator
+pyjwt
+bcrypt
+redis>=5.0
+openai
