@@ -32,6 +32,25 @@
   color: var(--cream);
   flex: 1;
   text-align: center;
+  cursor: pointer;
+  border-bottom: 1px dashed transparent;
+}
+
+.chapterTitle:hover {
+  border-bottom-color: var(--cream-faint);
+}
+
+.chapterTitleInput {
+  flex: 1;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 1.3rem;
+  text-align: center;
+  color: var(--cream);
+  background: var(--panel-raised);
+  border: 1px solid var(--brass-dim);
+  border-radius: var(--radius-sm);
+  padding: 2px var(--space-2);
 }
 
 .statusBadge {
@@ -186,6 +205,76 @@
 .siblingBtn:hover {
   color: var(--ink);
   border-color: var(--ink);
+}
+
+/* cast — add a character mid-chapter, from the compose bar */
+.castRow {
+  width: 100%;
+  max-width: 700px;
+  margin-top: var(--space-6);
+  display: flex;
+  justify-content: flex-end;
+}
+
+.castToggle {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--cream-muted);
+  background: transparent;
+  border: none;
+  text-decoration: underline dotted;
+}
+
+.castToggle:hover {
+  color: var(--brass-bright);
+}
+
+.castForm {
+  width: 100%;
+  max-width: 700px;
+  margin-top: var(--space-3);
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.castFormRow {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.castInput {
+  flex: 1;
+  font-family: var(--font-manuscript);
+  font-size: 0.92rem;
+  background: var(--panel-raised);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-sm);
+  color: var(--cream);
+  padding: var(--space-2) var(--space-3);
+}
+
+.castHint {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--cream-faint);
+}
+
+.notice {
+  width: 100%;
+  max-width: 700px;
+  margin-top: var(--space-4);
+  background: rgba(201, 138, 52, 0.12);
+  color: var(--brass-bright);
+  border: 1px solid var(--brass-dim);
+  border-radius: var(--radius-sm);
+  padding: var(--space-3) var(--space-4);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
 }
 
 /* compose bar sits below the page, still on the dark desk */

@@ -1,0 +1,14 @@
+.form {
+  composes: form from "../../styles/shared.module.css";
+  max-width: 640px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+}
+
+.wide {
+  grid-column: 1 / -1;
+}

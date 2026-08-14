@@ -1,3 +1,5 @@
+import json
+from collections.abc import AsyncIterator
 from functools import lru_cache
 
 import httpx
@@ -42,6 +44,53 @@ async def _call_openai(prompt: str, max_tokens: int) -> str:
 
 
 async def call_model(prompt: str, max_tokens: int) -> str:
+    """Non-streaming — used by the background summarizer, which has no client
+    waiting on incremental output."""
     if get_settings().llm_provider == "ollama":
         return await _call_ollama(prompt, max_tokens)
     return await _call_openai(prompt, max_tokens)
+
+
+async def _stream_ollama(prompt: str, max_tokens: int) -> AsyncIterator[str]:
+    settings = get_settings()
+    async with httpx.AsyncClient(timeout=120) as client, client.stream(
+        "POST",
+        f"{settings.ollama_base_url}/api/chat",
+        json={
+            "model": settings.ollama_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "think": False,
+            "stream": True,
+            "options": {"num_predict": max_tokens},
+        },
+    ) as response:
+        response.raise_for_status()
+        async for line in response.aiter_lines():
+            if not line:
+                continue
+            chunk = json.loads(line)
+            content = chunk.get("message", {}).get("content")
+            if content:
+                yield content
+            if chunk.get("done"):
+                break
+
+
+async def _stream_openai(prompt: str, max_tokens: int) -> AsyncIterator[str]:
+    settings = get_settings()
+    stream = await _openai_client().chat.completions.create(
+        model=settings.openai_model,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        stream=True,
+    )
+    async for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
+
+
+def stream_model(prompt: str, max_tokens: int) -> AsyncIterator[str]:
+    if get_settings().llm_provider == "ollama":
+        return _stream_ollama(prompt, max_tokens)
+    return _stream_openai(prompt, max_tokens)

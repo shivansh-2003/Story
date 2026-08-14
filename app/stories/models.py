@@ -40,6 +40,11 @@ class Story(Base):
     rating: Mapped[str | None] = mapped_column(Text)
     premise: Mapped[str | None] = mapped_column(Text)
     opening_line: Mapped[str | None] = mapped_column(Text)
+    setting: Mapped[str | None] = mapped_column(Text)
+    themes: Mapped[list[str] | None] = mapped_column(ARRAY(String))
+    content_boundaries: Mapped[str | None] = mapped_column(Text)
+    writing_style_notes: Mapped[str | None] = mapped_column(Text)
+    target_audience: Mapped[str | None] = mapped_column(Text)
     status: Mapped[StoryStatus] = mapped_column(
         Enum(StoryStatus, name="story_status"), default=StoryStatus.draft, server_default="draft"
     )

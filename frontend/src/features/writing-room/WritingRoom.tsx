@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type FormEvent, type KeyboardEvent } from "react";
 import { Link, useParams } from "react-router-dom";
-import { getChapter } from "@/features/chapters/chaptersApi";
+import { createAndActivateCharacter, getChapter, updateChapter } from "@/features/chapters/chaptersApi";
 import type { ChapterDetail } from "@/lib/types";
 import styles from "./WritingRoom.module.css";
 import { useChapterSession } from "./useChapterSession";
@@ -28,6 +28,16 @@ export function WritingRoom() {
   const [justAccepted, setJustAccepted] = useState(false);
   const syncManualEdit = useDebouncedManualEdit(storyId, chapterId, doManualEdit);
 
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
+  const [titleSaving, setTitleSaving] = useState(false);
+
+  const [showAddCharacter, setShowAddCharacter] = useState(false);
+  const [newCharName, setNewCharName] = useState("");
+  const [newCharRole, setNewCharRole] = useState("");
+  const [addCharacterBusy, setAddCharacterBusy] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+
   useEffect(() => {
     loadChapter();
     getChapter(storyId, chapterId).then(setChapterMeta);
@@ -41,13 +51,86 @@ export function WritingRoom() {
     setTimeout(() => setJustAccepted(false), 950);
   }
 
+  function startEditingTitle() {
+    setTitleDraft(chapterMeta?.title ?? "");
+    setEditingTitle(true);
+  }
+
+  async function saveTitle() {
+    const nextTitle = titleDraft.trim();
+    setEditingTitle(false);
+    if (!chapterMeta || nextTitle === (chapterMeta.title ?? "")) return;
+
+    setTitleSaving(true);
+    try {
+      const updated = await updateChapter(storyId, chapterId, { title: nextTitle || null });
+      setChapterMeta((meta) => (meta ? { ...meta, title: updated.title } : meta));
+    } catch (err) {
+      setNotice((err as Error).message);
+    } finally {
+      setTitleSaving(false);
+    }
+  }
+
+  function handleTitleKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Enter") e.currentTarget.blur(); // triggers saveTitle via onBlur
+    if (e.key === "Escape") setEditingTitle(false);
+  }
+
+  async function handleAddCharacter(e: FormEvent) {
+    e.preventDefault();
+    setAddCharacterBusy(true);
+    try {
+      const character = await createAndActivateCharacter(storyId, chapterId, {
+        name: newCharName,
+        role: newCharRole || null,
+      });
+      // Nudge the model that this character is new to the moment, not just
+      // present in a flat cast list — otherwise nothing in the prompt signals
+      // they weren't already standing there.
+      setInstruction((prev) =>
+        prev.trim() ? `${prev.trim()} ${character.name} enters the scene.` : `${character.name} enters the scene.`,
+      );
+      setNotice(
+        `${character.name} added to this chapter — appears starting with your next generation. The current draft isn't affected.`,
+      );
+      setTimeout(() => setNotice(null), 8000);
+      setNewCharName("");
+      setNewCharRole("");
+      setShowAddCharacter(false);
+    } catch (err) {
+      setNotice((err as Error).message);
+    } finally {
+      setAddCharacterBusy(false);
+    }
+  }
+
   return (
     <div className={styles.room}>
       <div className={styles.topbar}>
         <Link className={styles.backLink} to={`/stories/${storyId}`}>
           ← story
         </Link>
-        <h1 className={styles.chapterTitle}>{chapterMeta?.title ?? "Untitled chapter"}</h1>
+        {editingTitle ? (
+          <input
+            className={styles.chapterTitleInput}
+            value={titleDraft}
+            onChange={(e) => setTitleDraft(e.target.value)}
+            onBlur={saveTitle}
+            onKeyDown={handleTitleKeyDown}
+            placeholder="Untitled chapter"
+            autoFocus
+          />
+        ) : (
+          <h1
+            className={styles.chapterTitle}
+            onClick={startEditingTitle}
+            title="Click to rename"
+            aria-busy={titleSaving}
+          >
+            {chapterMeta?.title ?? "Untitled chapter"}
+          </h1>
+        )}
         <span className={styles.statusBadge}>{state.chapterStatus ?? chapterMeta?.status ?? "…"}</span>
       </div>
 
@@ -108,6 +191,41 @@ export function WritingRoom() {
           </div>
         )}
       </div>
+
+      <div className={styles.castRow}>
+        <button className={styles.castToggle} onClick={() => setShowAddCharacter((v) => !v)}>
+          {showAddCharacter ? "cancel" : "+ add a character to this scene"}
+        </button>
+      </div>
+
+      {showAddCharacter && (
+        <form className={styles.castForm} onSubmit={handleAddCharacter}>
+          <div className={styles.castFormRow}>
+            <input
+              className={styles.castInput}
+              value={newCharName}
+              onChange={(e) => setNewCharName(e.target.value)}
+              placeholder="Character name"
+              autoFocus
+              required
+            />
+            <input
+              className={styles.castInput}
+              value={newCharRole}
+              onChange={(e) => setNewCharRole(e.target.value)}
+              placeholder="Role (optional)"
+            />
+            <button className={styles.toolbarBtnPrimary} type="submit" disabled={addCharacterBusy || !newCharName.trim()}>
+              Add
+            </button>
+          </div>
+          <span className={styles.castHint}>
+            Applies to your next generation, not the draft currently pending.
+          </span>
+        </form>
+      )}
+
+      {notice && <div className={styles.notice}>{notice}</div>}
 
       <div className={styles.compose}>
         <textarea

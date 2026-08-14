@@ -5,6 +5,8 @@ from fastapi import APIRouter, status
 from app.chapters import service
 from app.chapters.models import Chapter
 from app.chapters.schemas import ChapterCreate, ChapterDetailRead, ChapterRead, ChapterReorderRequest, ChapterUpdate
+from app.characters.models import Character
+from app.characters.schemas import CharacterCreate, CharacterRead
 from app.core.deps import CurrentUser, DbSession, get_owned_chapter
 
 router = APIRouter(prefix="/stories/{story_id}/chapters", tags=["chapters"])
@@ -52,6 +54,13 @@ async def archive_chapter(
     story_id: uuid.UUID, chapter_id: uuid.UUID, db: DbSession, current_user: CurrentUser
 ) -> None:
     await service.archive_chapter(db, current_user, story_id, chapter_id)
+
+
+@router.post("/{chapter_id}/characters/new", response_model=CharacterRead, status_code=status.HTTP_201_CREATED)
+async def create_and_activate_character(
+    story_id: uuid.UUID, chapter_id: uuid.UUID, body: CharacterCreate, db: DbSession, current_user: CurrentUser
+) -> Character:
+    return await service.create_and_activate_character(db, current_user, story_id, chapter_id, body)
 
 
 @router.post("/{chapter_id}/characters", status_code=status.HTTP_204_NO_CONTENT)

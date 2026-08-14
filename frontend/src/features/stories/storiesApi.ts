@@ -10,6 +10,11 @@ export type StoryInput = {
   rating?: string | null;
   premise?: string | null;
   opening_line?: string | null;
+  setting?: string | null;
+  themes?: string[] | null;
+  content_boundaries?: string | null;
+  writing_style_notes?: string | null;
+  target_audience?: string | null;
   status?: StoryStatus;
 };
 

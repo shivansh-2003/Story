@@ -1,5 +1,5 @@
 import { apiFetch } from "@/lib/apiFetch";
-import type { Chapter, ChapterDetail, ChapterStatus, UUID } from "@/lib/types";
+import type { Chapter, ChapterDetail, ChapterStatus, Character, UUID } from "@/lib/types";
 
 export type ChapterInput = {
   title?: string | null;
@@ -33,6 +33,18 @@ export const addActiveCharacter = (storyId: UUID, chapterId: UUID, characterId: 
     method: "POST",
     query: { character_id: characterId },
   });
+
+export type NewCharacterInput = {
+  name: string;
+  role?: string | null;
+  motivation?: string | null;
+  backstory?: string | null;
+};
+
+// Creates the character AND activates it in this chapter in one call —
+// so the frontend doesn't sequence a create + an activate request.
+export const createAndActivateCharacter = (storyId: UUID, chapterId: UUID, body: NewCharacterInput) =>
+  apiFetch<Character>(`/stories/${storyId}/chapters/${chapterId}/characters/new`, { method: "POST", body });
 
 export const removeActiveCharacter = (storyId: UUID, chapterId: UUID, characterId: UUID) =>
   apiFetch<void>(`/stories/${storyId}/chapters/${chapterId}/characters/${characterId}`, { method: "DELETE" });

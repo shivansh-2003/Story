@@ -69,3 +69,36 @@
   gap: var(--space-2);
   align-items: center;
 }
+
+.editToggle {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--cream-muted);
+  background: transparent;
+  border: none;
+  text-decoration: underline dotted;
+  margin-bottom: var(--space-3);
+}
+
+.editToggle:hover {
+  color: var(--brass-bright);
+}
+
+.bibleForm {
+  composes: form from "../../styles/shared.module.css";
+  max-width: 640px;
+}
+
+.bibleFormGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+}
+
+.bibleFormGrid > label {
+  grid-column: span 1;
+}
+
+.bibleFormWide {
+  grid-column: 1 / -1;
+}

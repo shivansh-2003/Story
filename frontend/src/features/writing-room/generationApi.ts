@@ -1,4 +1,4 @@
-import { apiFetch } from "@/lib/apiFetch";
+import { apiFetch, apiStream } from "@/lib/apiFetch";
 import type { Turn, UUID } from "@/lib/types";
 
 // Adapted from the generation-module frontend guide: the actual backend
@@ -9,15 +9,24 @@ import type { Turn, UUID } from "@/lib/types";
 
 const base = (storyId: UUID, chapterId: UUID) => `/stories/${storyId}/chapters/${chapterId}`;
 
+// generate/generateEdit stream via SSE — app/generation/router.py returns
+// text/event-stream, not a single TurnOut body, so these resolve to void and
+// report progress through onDelta instead of a return value.
+
 export const generate = (
   storyId: UUID,
   chapterId: UUID,
   instruction: string,
   length: "short" | "standard" | "long",
-) => apiFetch<Turn>(`${base(storyId, chapterId)}/generate`, { method: "POST", body: { instruction, length } });
+  onDelta: (delta: string) => void,
+) => apiStream(`${base(storyId, chapterId)}/generate`, { instruction, length }, onDelta);
 
-export const generateEdit = (storyId: UUID, chapterId: UUID, instruction: string) =>
-  apiFetch<Turn>(`${base(storyId, chapterId)}/generate/edit`, { method: "POST", body: { instruction } });
+export const generateEdit = (
+  storyId: UUID,
+  chapterId: UUID,
+  instruction: string,
+  onDelta: (delta: string) => void,
+) => apiStream(`${base(storyId, chapterId)}/generate/edit`, { instruction }, onDelta);
 
 export const manualEdit = (storyId: UUID, chapterId: UUID, content: string) =>
   apiFetch<Turn>(`${base(storyId, chapterId)}/manual-edit`, { method: "POST", body: { content } });

@@ -16,6 +16,11 @@ class StoryBase(BaseModel):
     rating: str | None = None
     premise: str | None = None
     opening_line: str | None = None
+    setting: str | None = None
+    themes: list[str] | None = None
+    content_boundaries: str | None = None
+    writing_style_notes: str | None = None
+    target_audience: str | None = None
 
 
 class StoryCreate(StoryBase):
@@ -31,6 +36,11 @@ class StoryUpdate(BaseModel):
     rating: str | None = None
     premise: str | None = None
     opening_line: str | None = None
+    setting: str | None = None
+    themes: list[str] | None = None
+    content_boundaries: str | None = None
+    writing_style_notes: str | None = None
+    target_audience: str | None = None
     status: StoryStatus | None = None
 
 

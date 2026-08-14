@@ -62,3 +62,20 @@ async def add_relationship(
     await db.commit()
     await db.refresh(relationship)
     return relationship
+
+
+async def list_relationships_among(
+    db: AsyncSession, character_ids: list[uuid.UUID]
+) -> list[CharacterRelationship]:
+    """Relationships where both sides are in the given set — used by the
+    generation assembler to surface only relationships relevant to characters
+    actually active in the current chapter, not the writer's full cast."""
+    if not character_ids:
+        return []
+    result = await db.execute(
+        select(CharacterRelationship).where(
+            CharacterRelationship.character_id.in_(character_ids),
+            CharacterRelationship.related_character_id.in_(character_ids),
+        )
+    )
+    return list(result.scalars().all())

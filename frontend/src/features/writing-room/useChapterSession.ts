@@ -37,19 +37,29 @@ export function useChapterSession(storyId: UUID, chapterId: UUID) {
     // no GET .../session endpoint exposing Redis state. Known gap, see WritingRoom.
   }, [storyId, chapterId]);
 
+  // Both stream: the pending draft appears empty, then grows word-by-word as
+  // SSE chunks arrive, instead of popping in all at once after a multi-second
+  // wait. The accumulated text IS what lands in Redis (server does the same
+  // concatenation) — no follow-up fetch needed once the stream reports done.
   const doGenerate = useCallback(
     async (instruction: string, length: "short" | "standard" | "long") => {
-      setState((s) => ({ ...s, status: "generating", errorMessage: null }));
+      setState((s) => ({
+        ...s,
+        status: "generating",
+        errorMessage: null,
+        siblingAttempts: s.pendingTurn ? [s.pendingTurn, ...s.siblingAttempts].slice(0, 3) : s.siblingAttempts,
+        pendingTurn: { content: "", instruction, source: "ai" },
+      }));
       try {
-        const turn = await api.generate(storyId, chapterId, instruction, length);
-        setState((s) => ({
-          ...s,
-          status: "idle",
-          siblingAttempts: s.pendingTurn ? [s.pendingTurn, ...s.siblingAttempts].slice(0, 3) : s.siblingAttempts,
-          pendingTurn: turn,
-        }));
+        await api.generate(storyId, chapterId, instruction, length, (delta) => {
+          setState((s) => ({
+            ...s,
+            pendingTurn: s.pendingTurn ? { ...s.pendingTurn, content: s.pendingTurn.content + delta } : s.pendingTurn,
+          }));
+        });
+        setState((s) => ({ ...s, status: "idle" }));
       } catch (e) {
-        setState((s) => ({ ...s, status: "error", errorMessage: (e as Error).message }));
+        setState((s) => ({ ...s, status: "error", errorMessage: (e as Error).message, pendingTurn: null }));
       }
     },
     [storyId, chapterId],
@@ -57,17 +67,23 @@ export function useChapterSession(storyId: UUID, chapterId: UUID) {
 
   const doEditInstruction = useCallback(
     async (instruction: string) => {
-      setState((s) => ({ ...s, status: "generating", errorMessage: null }));
+      setState((s) => ({
+        ...s,
+        status: "generating",
+        errorMessage: null,
+        siblingAttempts: s.pendingTurn ? [s.pendingTurn, ...s.siblingAttempts].slice(0, 3) : s.siblingAttempts,
+        pendingTurn: { content: "", instruction, source: "ai" },
+      }));
       try {
-        const turn = await api.generateEdit(storyId, chapterId, instruction);
-        setState((s) => ({
-          ...s,
-          status: "idle",
-          siblingAttempts: s.pendingTurn ? [s.pendingTurn, ...s.siblingAttempts].slice(0, 3) : s.siblingAttempts,
-          pendingTurn: turn,
-        }));
+        await api.generateEdit(storyId, chapterId, instruction, (delta) => {
+          setState((s) => ({
+            ...s,
+            pendingTurn: s.pendingTurn ? { ...s.pendingTurn, content: s.pendingTurn.content + delta } : s.pendingTurn,
+          }));
+        });
+        setState((s) => ({ ...s, status: "idle" }));
       } catch (e) {
-        setState((s) => ({ ...s, status: "error", errorMessage: (e as Error).message }));
+        setState((s) => ({ ...s, status: "error", errorMessage: (e as Error).message, pendingTurn: null }));
       }
     },
     [storyId, chapterId],

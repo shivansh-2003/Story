@@ -3,7 +3,8 @@ import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.chapters.service import list_active_characters
-from app.characters.models import Character
+from app.characters.models import Character, CharacterRelationship
+from app.characters.service import list_relationships_among
 from app.stories.models import Story
 
 MAX_PROMPT_TOKENS = 6000  # tune against your model; leaves room for generation output
@@ -22,8 +23,12 @@ async def build_continue_prompt(
     either doesn't exist or was AI-sourced, not user-edited)."""
     story = await db.get(Story, story_id)
     characters = await list_active_characters(db, chapter_id)
+    relationships = await list_relationships_among(db, [c.id for c in characters])
 
     parts = [_format_bible(story), _format_characters(characters)]
+    relationships_text = _format_relationships(characters, relationships)
+    if relationships_text:
+        parts.append(relationships_text)
     if prior_chapter_summaries:
         parts.append(_format_prior_summaries(prior_chapter_summaries))
     if session_state["running_summary"]:
@@ -52,13 +57,16 @@ async def build_edit_prompt(
     chapter's context and risk rewriting more than intended."""
     story = await db.get(Story, story_id)
     characters = await list_active_characters(db, chapter_id)
+    relationships = await list_relationships_among(db, [c.id for c in characters])
     pending = session_state["pending_turn"]
     if pending is None:
         raise ValueError("No pending turn to edit")
 
-    parts = [
-        _format_bible(story),
-        _format_characters(characters),
+    parts = [_format_bible(story), _format_characters(characters)]
+    relationships_text = _format_relationships(characters, relationships)
+    if relationships_text:
+        parts.append(relationships_text)
+    parts += [
         f"Current draft text:\n{pending['content']}",
         f"Edit instruction: {instruction}",
         "Return only the revised paragraph(s), same approximate length.",
@@ -79,16 +87,47 @@ def _enforce_budget(prompt: str) -> str:
 
 
 def _format_bible(story: Story) -> str:
-    return (
-        f"Story: {story.title} | Genre: {story.genre} | Tone: {story.tone} | "
-        f"POV: {story.pov} | Premise: {story.premise}"
-    )
+    # skip unset fields rather than printing "Tone: None" into the prompt —
+    # most of these are optional and a writer may never fill them in.
+    fields = {
+        "Genre": ", ".join(story.genre) if story.genre else None,
+        "Tone": story.tone,
+        "POV": story.pov,
+        "Tense": story.tense,
+        "Setting": story.setting,
+        "Themes": ", ".join(story.themes) if story.themes else None,
+        "Premise": story.premise,
+        "Content boundaries": story.content_boundaries,
+        "Writing style": story.writing_style_notes,
+        "Target audience": story.target_audience,
+    }
+    lines = [f"{label}: {value}" for label, value in fields.items() if value]
+    return f"Story: {story.title}\n" + "\n".join(lines)
 
 
 def _format_characters(characters: list[Character]) -> str:
-    return "Characters in scene:\n" + "\n".join(
-        f"- {c.name} ({c.role}): {c.condensed_summary}" for c in characters
-    )
+    lines = []
+    for c in characters:
+        line = f"- {c.name}"
+        if c.role:
+            line += f" ({c.role})"
+        if c.condensed_summary:
+            line += f": {c.condensed_summary}"
+        lines.append(line)
+    return "Characters in scene:\n" + "\n".join(lines)
+
+
+def _format_relationships(
+    characters: list[Character], relationships: list[CharacterRelationship]
+) -> str | None:
+    if not relationships:
+        return None
+    names = {c.id: c.name for c in characters}
+    lines = [
+        f"- {names[r.character_id]} → {names[r.related_character_id]}: {r.relationship_label or 'connected'}"
+        for r in relationships
+    ]
+    return "Relationships:\n" + "\n".join(lines)
 
 
 def _format_prior_summaries(summaries: list[str]) -> str:

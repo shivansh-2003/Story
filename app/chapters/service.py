@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.chapters.models import Chapter, ChapterCharacter, ChapterStatus
 from app.chapters.schemas import ChapterCreate, ChapterReorderRequest, ChapterUpdate
 from app.characters.models import Character
+from app.characters.schemas import CharacterCreate
 from app.core.deps import get_owned_chapter, get_owned_character, get_owned_story
 from app.generation.models import ChapterTurn
 from app.users.models import User
@@ -97,6 +98,24 @@ async def remove_active_character(
 
     await db.delete(link)
     await db.commit()
+
+
+async def create_and_activate_character(
+    db: AsyncSession, user: User, story_id: uuid.UUID, chapter_id: uuid.UUID, body: CharacterCreate
+) -> Character:
+    """Create a character and mark it active in this chapter in one
+    transaction — for "a new character just entered the scene," so the
+    frontend doesn't have to sequence a create + an activate call."""
+    await get_owned_chapter(db, story_id, chapter_id, user)
+
+    character = Character(user_id=user.id, **body.model_dump())
+    db.add(character)
+    await db.flush()  # assign character.id before the link row needs it
+
+    db.add(ChapterCharacter(chapter_id=chapter_id, character_id=character.id))
+    await db.commit()
+    await db.refresh(character)
+    return character
 
 
 async def list_active_characters(db: AsyncSession, chapter_id: uuid.UUID) -> list[Character]:
