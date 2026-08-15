@@ -14,7 +14,7 @@ export type CharacterInput = {
   backstory?: string | null;
 };
 
-export const listCharacters = () => apiFetch<Character[]>("/characters");
+export const listCharacters = (signal?: AbortSignal) => apiFetch<Character[]>("/characters", { signal });
 
 export const createCharacter = (body: CharacterInput) =>
   apiFetch<Character>("/characters", { method: "POST", body });

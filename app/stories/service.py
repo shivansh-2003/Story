@@ -6,12 +6,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.characters.models import Character
 from app.core.deps import get_owned_character, get_owned_story
+from app.core.logging_utils import log_execution
 from app.core.status import assert_transition
 from app.stories.models import STORY_TRANSITIONS, Story, StoryCharacter
 from app.stories.schemas import StoryCreate, StoryUpdate
 from app.users.models import User
 
 
+@log_execution
 async def list_stories(db: AsyncSession, user: User) -> list[Story]:
     result = await db.execute(
         select(Story).where(Story.user_id == user.id, Story.is_archived.is_(False))
@@ -19,6 +21,7 @@ async def list_stories(db: AsyncSession, user: User) -> list[Story]:
     return list(result.scalars().all())
 
 
+@log_execution
 async def create_story(db: AsyncSession, user: User, body: StoryCreate) -> Story:
     story = Story(user_id=user.id, **body.model_dump())
     db.add(story)
@@ -27,6 +30,7 @@ async def create_story(db: AsyncSession, user: User, body: StoryCreate) -> Story
     return story
 
 
+@log_execution
 async def imported_characters(db: AsyncSession, story_id: uuid.UUID) -> list[Character]:
     result = await db.execute(
         select(Character).join(StoryCharacter, StoryCharacter.character_id == Character.id).where(
@@ -36,6 +40,7 @@ async def imported_characters(db: AsyncSession, story_id: uuid.UUID) -> list[Cha
     return list(result.scalars().all())
 
 
+@log_execution
 async def update_story(db: AsyncSession, user: User, story_id: uuid.UUID, body: StoryUpdate) -> Story:
     story = await get_owned_story(db, story_id, user)
     fields = body.model_dump(exclude_unset=True)
@@ -48,12 +53,14 @@ async def update_story(db: AsyncSession, user: User, story_id: uuid.UUID, body: 
     return story
 
 
+@log_execution
 async def archive_story(db: AsyncSession, user: User, story_id: uuid.UUID) -> None:
     story = await get_owned_story(db, story_id, user)
     story.is_archived = True
     await db.commit()
 
 
+@log_execution
 async def import_character(db: AsyncSession, user: User, story_id: uuid.UUID, character_id: uuid.UUID) -> None:
     await get_owned_story(db, story_id, user)
     await get_owned_character(db, character_id, user)
@@ -66,6 +73,7 @@ async def import_character(db: AsyncSession, user: User, story_id: uuid.UUID, ch
     await db.commit()
 
 
+@log_execution
 async def remove_character(db: AsyncSession, user: User, story_id: uuid.UUID, character_id: uuid.UUID) -> None:
     await get_owned_story(db, story_id, user)
 

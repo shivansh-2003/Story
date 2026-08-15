@@ -809,6 +809,8 @@ every statement is idempotent.
 |---|---|---|---|
 | `DATABASE_URL` | yes | — | `postgresql+asyncpg://...` — Neon's **pooled** (`-pooler`) endpoint. Neon's dashboard gives you a `postgresql://...?sslmode=require&channel_binding=require` string — swap the scheme to `postgresql+asyncpg://` and drop the query params, `asyncpg` doesn't parse them like `libpq` does. |
 | `DATABASE_SSL_REQUIRE` | no | `true` | Set `false` only for local Postgres without SSL. |
+| `DB_POOL_SIZE` | no | `5` | Base SQLAlchemy pool size. Neon's per-role connection ceiling varies by plan — check your dashboard before raising this. |
+| `DB_MAX_OVERFLOW` | no | `5` | Extra connections allowed above `DB_POOL_SIZE` under burst load. |
 | `JWT_SECRET` | yes | — | Any long random string. |
 | `JWT_ALGORITHM` | no | `HS256` | |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | no | `60` | |
@@ -842,3 +844,109 @@ Open `http://localhost:5173`, sign up, and you're in.
 - **Generation requests hang or 502** — for `LLM_PROVIDER=ollama`, confirm
   Ollama is actually running (`ollama list`) and the model in
   `OLLAMA_MODEL` has been pulled.
+
+---
+
+## 10. Logging and observability
+
+```mermaid
+flowchart LR
+    Func["a decorated function\n(service layer, llm_client, assembler...)"] --> Dec["@log_execution"]
+    Dec --> Root["root logger"]
+    Route["every HTTP request"] --> MW["request-timing middleware\n(app/main.py)"]
+    MW --> Root
+    Root --> Stdout["StreamHandler → terminal\n(live while uvicorn runs)"]
+    Root --> File["RotatingFileHandler → logs/app.log\n(10MB × 5 backups)"]
+```
+
+Every function call, every HTTP request, and every prompt-caching-candidate
+read is logged with a start time, an elapsed duration in milliseconds, and —
+on failure — the exception type and message (never swallowed, always
+re-raised after logging). Logs go to **both** the terminal (while `uvicorn`
+is running) and `logs/app.log`, so they're visible live and still there
+afterward.
+
+### Verbosity — `LOG_LEVEL`
+
+Set in `.env`, default `INFO`. At `INFO` you get one line per function call
+(start + done/failed) and one line per HTTP request. Set `LOG_LEVEL=DEBUG`
+to additionally see **per-query duration** from Postgres (via a SQLAlchemy
+cursor-execute event listener in `app/database.py`) — off by default since
+it's noisy; the SQL statement and its parameters are deliberately never
+logged, only how long each query took.
+
+### What the labels mean
+
+Greppable tags that show up in the log lines, so you can pull out exactly
+the signal you're after:
+
+| Label | Where | Meaning |
+|---|---|---|
+| `PREPARE_PHASE` | `generation/service.py` | The database-dependent setup for a generation call (fetching the story bible, active characters, prior summaries) — everything that has to finish *before* streaming can start. |
+| `GENERATE` / `EDIT` | `generation/service.py` | The streaming generation/edit call itself, end to end — includes the LLM round trip and the post-stream Redis/status bookkeeping. |
+| `LLM_STREAM` | `core/llm_client.py` | The raw provider call underneath `GENERATE`/`EDIT` — isolates actual model latency from the bookkeeping around it. |
+| `STREAM_TTFT` | any streamed function | Time-to-first-token — how long before the *first* chunk arrived. The number that actually determines how "responsive" generation feels. |
+| `STREAM_TOTAL` | any streamed function | Total duration once the stream is fully consumed, plus how many chunks it was made of. |
+| `CACHE_HIT` / `CACHE_MISS` | `generation/session_store.py` today; `# TODO` markers in `chapters/service.py` and `characters/service.py` for where a real cache layer would plug in next | Whether a lookup found something already there. Applied to Redis session reads now even though that's session state, not a cache — same read-or-miss shape, so the pattern is consistent once actual caching exists. |
+
+Example log line: `PREPARE_PHASE [app.generation.service.prepare_continue]
+START chapter_id='...' story_id='...' instruction=<redacted> length='short'`
+— followed by a `DONE 42.3ms` line once it finishes. Passwords, JWTs, and
+full prompt/completion text are never logged — sensitive parameters show as
+`<redacted>`, and anything that isn't a plain string/number/UUID shows only
+as its type name (e.g. `<AsyncSession>`), never a full object dump.
+
+---
+
+## 11. Latency optimization decisions
+
+Full measurements, methodology, and per-endpoint before/after data live in
+[`LATENCY_OPTIMIZATION_REPORT.md`](./LATENCY_OPTIMIZATION_REPORT.md). Summary
+of what was done and why:
+
+- **Parallelized independent prompt-assembly reads** (`generation/assembler.py`)
+  — story, active characters, and prior-chapter summaries no longer wait on
+  each other; fetched concurrently via `asyncio.gather`.
+- **Overlapped the chapter status write with prompt assembly** instead of
+  running it first — the write now happens inside the same window as the
+  gather above instead of blocking in front of it.
+- **Cached chapter body reconstruction in Redis** (`session_store.py`) —
+  previously rebuilt from `chapter_turns` on every read; now cached and
+  explicitly invalidated on accept.
+- **Made the DB connection pool size configurable** (`DB_POOL_SIZE` /
+  `DB_MAX_OVERFLOW`) and added a connection-acquisition-time warning to
+  catch pool exhaustion under load.
+- **Collapsed ownership-check round trips into single joined queries** —
+  `get_owned_chapter` and `list_chapters` each used to fetch the parent
+  `Story` and the target row as two separate queries; now one `JOIN`.
+- **Stopped re-fetching a `Chapter` row already fetched by the router** —
+  the validated object is threaded through `prepare_continue`,
+  `prepare_edit`, `accept_pending`, `discard_pending`, `complete_chapter`,
+  `lock_chapter`, and `unlock_chapter` instead of being re-queried.
+- **Added a pool-contention vs. compute-cold-start diagnostic** — extends
+  the acquisition warning with pool-usage and idle-gap data, so a slow
+  request can be attributed to Neon's compute waking up vs. genuine
+  connection-pool pressure instead of guessing.
+- **Added `AbortController` cancellation to frontend data-fetching hooks**
+  — cuts wasted duplicate requests from React `StrictMode`'s dev-only
+  double-invoke; client-side benefit only, not a backend latency fix.
+
+### Result summary
+
+| Change | Measured impact |
+|---|---|
+| Parallel prompt-assembly reads | 2.61x faster (6358.6ms → 2431.9ms avg) |
+| Status write overlapped with assembly | ~855ms removed from the critical path |
+| Chapter body Redis cache | ~99.5% faster on cache hits (~580ms → ~3ms) |
+| `get_owned_chapter` join + re-fetch elimination | `/accept` −18.8% end-to-end; chapter-detail reads −23.6% |
+| `list_chapters` join collapse | Directionally faster; not yet statistically confirmed |
+| Connection pool sizing | No per-request speedup — capacity/reliability only |
+| Pool-contention diagnostic | Confirmed remaining latency is Neon compute cold-start, not app code |
+| Frontend `AbortController` cleanup | Dev-loop only — doesn't reduce backend load |
+
+**Bottom line**: every code-level optimization above is real and verified,
+but the app's dominant remaining latency is Neon's serverless compute
+waking from auto-suspend (1.5–3s per request after an idle gap) — confirmed
+by the diagnostic above, and not fixable in application code. See the full
+report for the reasoning and the two remaining options (a keep-alive ping,
+or a Neon plan/tier change).

@@ -26,6 +26,7 @@ type FetchOptions = {
   body?: unknown;
   query?: Record<string, string>;
   skipAuth?: boolean;
+  signal?: AbortSignal;
 };
 
 export async function apiFetch<T>(path: string, options: FetchOptions = {}): Promise<T> {
@@ -43,6 +44,7 @@ export async function apiFetch<T>(path: string, options: FetchOptions = {}): Pro
     method: options.method ?? "GET",
     headers,
     body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+    signal: options.signal,
   });
 
   if (response.status === 401) {

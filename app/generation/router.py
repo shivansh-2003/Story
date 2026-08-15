@@ -38,8 +38,8 @@ async def generate(
     db: DbSession,
     current_user: CurrentUser,
 ) -> StreamingResponse:
-    await get_owned_chapter(db, story_id, chapter_id, current_user)
-    system, user, state = await service.prepare_continue(db, chapter_id, story_id, body.instruction, body.length)
+    chapter = await get_owned_chapter(db, story_id, chapter_id, current_user)
+    system, user, state = await service.prepare_continue(db, chapter, story_id, body.instruction, body.length)
     stream = service.generate_continue(system, user, state, chapter_id, body.instruction, body.length)
     return StreamingResponse(_sse(stream), media_type="text/event-stream")
 
@@ -55,9 +55,9 @@ async def generate_edit(
     """Regenerate against the current pending draft. Always acts on pending_turn
     as-is regardless of source (ai or user_edit) — this satisfies "don't
     discard hand-edits" without extra branching at the call site."""
-    await get_owned_chapter(db, story_id, chapter_id, current_user)
+    chapter = await get_owned_chapter(db, story_id, chapter_id, current_user)
     try:
-        system, user, state = await service.prepare_edit(db, chapter_id, story_id, body.instruction)
+        system, user, state = await service.prepare_edit(db, chapter, story_id, body.instruction)
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
     stream = service.edit_pending(system, user, state, chapter_id, body.instruction)
@@ -84,17 +84,17 @@ async def accept(
     db: DbSession,
     current_user: CurrentUser,
 ) -> dict:
-    await get_owned_chapter(db, story_id, chapter_id, current_user)
+    chapter = await get_owned_chapter(db, story_id, chapter_id, current_user)
     try:
-        return await service.accept_pending(db, chapter_id, background_tasks)
+        return await service.accept_pending(db, chapter, background_tasks)
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
 
 
 @router.post("/discard")
 async def discard(story_id: uuid.UUID, chapter_id: uuid.UUID, db: DbSession, current_user: CurrentUser) -> dict:
-    await get_owned_chapter(db, story_id, chapter_id, current_user)
-    await service.discard_pending(db, chapter_id)
+    chapter = await get_owned_chapter(db, story_id, chapter_id, current_user)
+    await service.discard_pending(db, chapter)
     return {"discarded": True}
 
 
@@ -106,9 +106,9 @@ async def complete(
     db: DbSession,
     current_user: CurrentUser,
 ) -> dict:
-    await get_owned_chapter(db, story_id, chapter_id, current_user)
+    chapter = await get_owned_chapter(db, story_id, chapter_id, current_user)
     try:
-        return await service.complete_chapter(db, chapter_id, background_tasks)
+        return await service.complete_chapter(db, chapter, background_tasks)
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
 

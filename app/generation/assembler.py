@@ -1,21 +1,44 @@
+import asyncio
 import uuid
 
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.chapters.service import list_active_characters
+from app.chapters.service import get_prior_chapter_summaries, list_active_characters
 from app.characters.models import Character, CharacterRelationship
 from app.characters.service import list_relationships_among
+from app.core.logging_utils import log_execution
+from app.database import async_session
 from app.stories.models import Story
 
 MAX_PROMPT_TOKENS = 6000  # applies to the user message only — see _assemble_continue_user
 
 
+@log_execution
+async def _fetch_story(story_id: uuid.UUID) -> Story:
+    async with async_session() as db:
+        return await db.get(Story, story_id)
+
+
+@log_execution
+async def _fetch_active_characters(chapter_id: uuid.UUID) -> list[Character]:
+    async with async_session() as db:
+        return await list_active_characters(db, chapter_id)
+
+
+@log_execution
+async def _fetch_prior_summaries(story_id: uuid.UUID, chapter_id: uuid.UUID) -> list[str]:
+    async with async_session() as db:
+        return await get_prior_chapter_summaries(db, story_id, chapter_id)
+
+
+@log_execution
+async def _fetch_relationships(character_ids: list[uuid.UUID]) -> list[CharacterRelationship]:
+    async with async_session() as db:
+        return await list_relationships_among(db, character_ids)
+
+
 async def build_continue_prompt(
-    db: AsyncSession,
     chapter_id: uuid.UUID,
     story_id: uuid.UUID,
     session_state: dict,
-    prior_chapter_summaries: list[str],
     instruction: str,
     length_words: int,
 ) -> tuple[str, str]:
@@ -26,10 +49,21 @@ async def build_continue_prompt(
     identical across every regenerate/edit within a chapter, so keeping it in
     its own message lets a provider (or Ollama's own KV-cache) reuse that
     prefix across a generate → regenerate → edit burst instead of re-sending
-    and re-evaluating it fresh every call."""
-    story = await db.get(Story, story_id)
-    characters = await list_active_characters(db, chapter_id)
-    relationships = await list_relationships_among(db, [c.id for c in characters])
+    and re-evaluating it fresh every call.
+
+    story, active characters, and prior-chapter summaries are three
+    independent reads with no data dependency between them, so they run
+    concurrently — each on its own short-lived session, since AsyncSession
+    isn't safe for interleaved use from multiple coroutines. relationships
+    genuinely depends on the character IDs from the characters fetch (it's
+    not independent — verified against the actual query before assuming
+    otherwise), so it runs after, not folded into the same gather()."""
+    story, characters, prior_chapter_summaries = await asyncio.gather(
+        _fetch_story(story_id),
+        _fetch_active_characters(chapter_id),
+        _fetch_prior_summaries(story_id, chapter_id),
+    )
+    relationships = await _fetch_relationships([c.id for c in characters])
 
     system = _build_system_prompt(story, characters, relationships)
     user = _assemble_continue_user(
@@ -43,7 +77,6 @@ async def build_continue_prompt(
 
 
 async def build_edit_prompt(
-    db: AsyncSession,
     chapter_id: uuid.UUID,
     story_id: uuid.UUID,
     session_state: dict,
@@ -56,10 +89,15 @@ async def build_edit_prompt(
 
     No trimming applied here: the draft + edit instruction are exactly the
     "never trim" content per _assemble_continue_user's ladder, so there's
-    nothing left that budget enforcement would ever touch."""
-    story = await db.get(Story, story_id)
-    characters = await list_active_characters(db, chapter_id)
-    relationships = await list_relationships_among(db, [c.id for c in characters])
+    nothing left that budget enforcement would ever touch.
+
+    Same story/characters concurrency as build_continue_prompt — see there
+    for why relationships isn't folded into the same gather()."""
+    story, characters = await asyncio.gather(
+        _fetch_story(story_id),
+        _fetch_active_characters(chapter_id),
+    )
+    relationships = await _fetch_relationships([c.id for c in characters])
     pending = session_state["pending_turn"]
     if pending is None:
         raise ValueError("No pending turn to edit")
@@ -75,6 +113,7 @@ async def build_edit_prompt(
     return system, user
 
 
+@log_execution
 def _build_system_prompt(
     story: Story, characters: list[Character], relationships: list[CharacterRelationship]
 ) -> str:
@@ -85,6 +124,7 @@ def _build_system_prompt(
     return "\n\n".join(parts)
 
 
+@log_execution
 def _assemble_continue_user(
     prior_summaries: list[str],
     running_summary: str,
@@ -138,6 +178,12 @@ def _approx_tokens(text: str) -> float:
     return len(text.split()) * 1.3
 
 
+# _approx_tokens and _format_prior_summaries deliberately NOT decorated: both
+# run inside _assemble_continue_user's trim loop and can fire hundreds of
+# times for one prompt (once per dropped summary) — @log_execution there
+# would be log spam with no extra signal, since _assemble_continue_user
+# itself already logs one START/DONE pair for the whole trimming pass.
+@log_execution
 def _format_bible(story: Story) -> str:
     # skip unset fields rather than printing "Tone: None" into the prompt —
     # most of these are optional and a writer may never fill them in.
@@ -157,6 +203,7 @@ def _format_bible(story: Story) -> str:
     return f"Story: {story.title}\n" + "\n".join(lines)
 
 
+@log_execution
 def _format_characters(characters: list[Character]) -> str:
     lines = []
     for c in characters:
@@ -169,6 +216,7 @@ def _format_characters(characters: list[Character]) -> str:
     return "Characters in scene:\n" + "\n".join(lines)
 
 
+@log_execution
 def _format_relationships(
     characters: list[Character], relationships: list[CharacterRelationship]
 ) -> str | None:

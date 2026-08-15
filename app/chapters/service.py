@@ -9,8 +9,11 @@ from app.chapters.schemas import ChapterCreate, ChapterReorderRequest, ChapterUp
 from app.characters.models import Character
 from app.characters.schemas import CharacterCreate
 from app.core.deps import get_owned_chapter, get_owned_character, get_owned_story
+from app.core.logging_utils import log_execution
 from app.core.status import assert_transition
+from app.generation import session_store
 from app.generation.models import ChapterTurn
+from app.stories.models import Story
 from app.users.models import User
 
 # statuses reachable only through a dedicated endpoint (POST /complete,
@@ -19,16 +22,27 @@ from app.users.models import User
 _PATCH_PROTECTED_STATUSES = {ChapterStatus.complete, ChapterStatus.locked}
 
 
+@log_execution
 async def list_chapters(db: AsyncSession, user: User, story_id: uuid.UUID) -> list[Chapter]:
-    await get_owned_story(db, story_id, user)
+    # single joined query instead of get_owned_story + a separate select —
+    # LEFT JOIN from Story so a valid-but-empty story still returns exactly
+    # one row (Chapter columns NULL), distinguishing it from a missing/
+    # forbidden story (zero rows), preserving get_owned_story's 404 semantics
+    # in one Neon round trip instead of two.
     result = await db.execute(
-        select(Chapter)
-        .where(Chapter.story_id == story_id, Chapter.is_archived.is_(False))
+        select(Story.user_id, Story.is_archived, Chapter)
+        .select_from(Story)
+        .outerjoin(Chapter, (Chapter.story_id == Story.id) & (Chapter.is_archived.is_(False)))
+        .where(Story.id == story_id)
         .order_by(Chapter.order_index)
     )
-    return list(result.scalars().all())
+    rows = result.all()
+    if not rows or rows[0].user_id != user.id or rows[0].is_archived:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Story not found")
+    return [row.Chapter for row in rows if row.Chapter is not None]
 
 
+@log_execution
 async def create_chapter(db: AsyncSession, user: User, story_id: uuid.UUID, body: ChapterCreate) -> Chapter:
     await get_owned_story(db, story_id, user)
 
@@ -43,6 +57,7 @@ async def create_chapter(db: AsyncSession, user: User, story_id: uuid.UUID, body
     return chapter
 
 
+@log_execution
 async def reorder_chapters(
     db: AsyncSession, user: User, story_id: uuid.UUID, body: ChapterReorderRequest
 ) -> None:
@@ -65,13 +80,23 @@ async def reorder_chapters(
     await db.commit()
 
 
+@log_execution
 async def get_chapter_body(db: AsyncSession, chapter_id: uuid.UUID) -> str:
+    # Rebuilt from chapter_turns on every read but only changes when a turn
+    # is accepted, so it's cached in Redis and invalidated explicitly by
+    # accept_pending — not a TTL-only cache.
+    cached = await session_store.get_cached_chapter_body(chapter_id)
+    if cached is not None:
+        return cached
     result = await db.execute(
         select(ChapterTurn.content).where(ChapterTurn.chapter_id == chapter_id).order_by(ChapterTurn.sequence)
     )
-    return "\n\n".join(result.scalars().all())
+    body = "\n\n".join(result.scalars().all())
+    await session_store.set_cached_chapter_body(chapter_id, body)
+    return body
 
 
+@log_execution
 async def update_chapter(
     db: AsyncSession, user: User, story_id: uuid.UUID, chapter_id: uuid.UUID, body: ChapterUpdate
 ) -> Chapter:
@@ -92,12 +117,14 @@ async def update_chapter(
     return chapter
 
 
+@log_execution
 async def archive_chapter(db: AsyncSession, user: User, story_id: uuid.UUID, chapter_id: uuid.UUID) -> None:
     chapter = await get_owned_chapter(db, story_id, chapter_id, user)
     chapter.is_archived = True
     await db.commit()
 
 
+@log_execution
 async def add_active_character(
     db: AsyncSession, user: User, story_id: uuid.UUID, chapter_id: uuid.UUID, character_id: uuid.UUID
 ) -> None:
@@ -112,6 +139,7 @@ async def add_active_character(
     await db.commit()
 
 
+@log_execution
 async def remove_active_character(
     db: AsyncSession, user: User, story_id: uuid.UUID, chapter_id: uuid.UUID, character_id: uuid.UUID
 ) -> None:
@@ -125,6 +153,7 @@ async def remove_active_character(
     await db.commit()
 
 
+@log_execution
 async def create_and_activate_character(
     db: AsyncSession, user: User, story_id: uuid.UUID, chapter_id: uuid.UUID, body: CharacterCreate
 ) -> Character:
@@ -143,7 +172,12 @@ async def create_and_activate_character(
     return character
 
 
+@log_execution
 async def list_active_characters(db: AsyncSession, chapter_id: uuid.UUID) -> list[Character]:
+    # TODO: call log_cache_event here once a cache layer exists for this
+    # lookup — per the backend optimization plan, this is a caching
+    # candidate (queried on every prompt build within a chapter's writing
+    # session, changes only when the active cast is edited).
     result = await db.execute(
         select(Character)
         .join(ChapterCharacter, ChapterCharacter.character_id == Character.id)
@@ -152,6 +186,7 @@ async def list_active_characters(db: AsyncSession, chapter_id: uuid.UUID) -> lis
     return list(result.scalars().all())
 
 
+@log_execution
 async def get_prior_chapter_summaries(
     db: AsyncSession, story_id: uuid.UUID, before_chapter_id: uuid.UUID
 ) -> list[str]:
@@ -168,6 +203,7 @@ async def get_prior_chapter_summaries(
     return list(result.scalars().all())
 
 
+@log_execution
 async def update_chapter_summary(
     db: AsyncSession,
     chapter_id: uuid.UUID,
@@ -183,18 +219,24 @@ async def update_chapter_summary(
     await db.commit()
 
 
-async def set_chapter_status(db: AsyncSession, chapter_id: uuid.UUID, new_status: ChapterStatus) -> None:
-    chapter = await db.get(Chapter, chapter_id)
+@log_execution
+async def set_chapter_status(
+    db: AsyncSession, chapter_id: uuid.UUID, new_status: ChapterStatus, chapter: Chapter | None = None
+) -> None:
+    if chapter is None:
+        chapter = await db.get(Chapter, chapter_id)
     assert_transition(chapter.status, new_status, CHAPTER_TRANSITIONS)
     chapter.status = new_status
     await db.commit()
 
 
+@log_execution
 async def lock_chapter(db: AsyncSession, user: User, story_id: uuid.UUID, chapter_id: uuid.UUID) -> None:
-    await get_owned_chapter(db, story_id, chapter_id, user)
-    await set_chapter_status(db, chapter_id, ChapterStatus.locked)
+    chapter = await get_owned_chapter(db, story_id, chapter_id, user)
+    await set_chapter_status(db, chapter_id, ChapterStatus.locked, chapter=chapter)
 
 
+@log_execution
 async def unlock_chapter(db: AsyncSession, user: User, story_id: uuid.UUID, chapter_id: uuid.UUID) -> None:
-    await get_owned_chapter(db, story_id, chapter_id, user)
-    await set_chapter_status(db, chapter_id, ChapterStatus.complete)
+    chapter = await get_owned_chapter(db, story_id, chapter_id, user)
+    await set_chapter_status(db, chapter_id, ChapterStatus.complete, chapter=chapter)

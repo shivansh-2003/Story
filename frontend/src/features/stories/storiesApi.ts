@@ -22,7 +22,7 @@ export const listStories = () => apiFetch<Story[]>("/stories");
 
 export const createStory = (body: StoryInput) => apiFetch<Story>("/stories", { method: "POST", body });
 
-export const getStory = (id: UUID) => apiFetch<StoryDetail>(`/stories/${id}`);
+export const getStory = (id: UUID, signal?: AbortSignal) => apiFetch<StoryDetail>(`/stories/${id}`, { signal });
 
 export const updateStory = (id: UUID, body: Partial<StoryInput>) =>
   apiFetch<Story>(`/stories/${id}`, { method: "PATCH", body });

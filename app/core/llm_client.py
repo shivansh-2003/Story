@@ -8,6 +8,7 @@ import httpx
 from openai import AsyncOpenAI
 
 from app.config import get_settings
+from app.core.logging_utils import log_execution
 
 logger = logging.getLogger("story_assistant.llm")
 
@@ -62,6 +63,7 @@ async def _call_openai(user: str, max_tokens: int, system: str | None) -> str:
     return response.choices[0].message.content or ""
 
 
+@log_execution
 async def call_model(user: str, max_tokens: int, system: str | None = None) -> str:
     """Non-streaming — used by the background summarizer, which has no client
     waiting on incremental output. Retries on failure: a summarization call
@@ -83,6 +85,7 @@ async def call_model(user: str, max_tokens: int, system: str | None = None) -> s
     raise last_error
 
 
+@log_execution(label="LLM_STREAM")
 async def _stream_ollama(user: str, max_tokens: int, system: str | None) -> AsyncIterator[str]:
     settings = get_settings()
     async with _ollama_client().stream(
@@ -108,6 +111,7 @@ async def _stream_ollama(user: str, max_tokens: int, system: str | None) -> Asyn
                 break
 
 
+@log_execution(label="LLM_STREAM")
 async def _stream_openai(user: str, max_tokens: int, system: str | None) -> AsyncIterator[str]:
     settings = get_settings()
     stream = await _openai_client().chat.completions.create(
@@ -122,6 +126,11 @@ async def _stream_openai(user: str, max_tokens: int, system: str | None) -> Asyn
             yield delta
 
 
+# not decorated itself — it's a synchronous 2-line dispatch that returns an
+# async generator without awaiting anything; @log_execution on a plain sync
+# function would time only that instant dispatch, not the actual streaming.
+# The real work — and the TTFT/total timing — happens in the two functions
+# it returns, which are decorated directly above.
 def stream_model(user: str, max_tokens: int, system: str | None = None) -> AsyncIterator[str]:
     if get_settings().llm_provider == "ollama":
         return _stream_ollama(user, max_tokens, system)

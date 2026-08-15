@@ -3,6 +3,7 @@ from typing import Annotated
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.chapters.models import Chapter
@@ -50,8 +51,20 @@ async def get_owned_character(db: AsyncSession, character_id: uuid.UUID, user: U
 
 
 async def get_owned_chapter(db: AsyncSession, story_id: uuid.UUID, chapter_id: uuid.UUID, user: User) -> Chapter:
-    await get_owned_story(db, story_id, user)
-    chapter = await db.get(Chapter, chapter_id)
-    if chapter is None or chapter.is_archived or chapter.story_id != story_id:
+    # single joined query instead of a separate story-ownership round trip
+    # followed by a chapter fetch — same checks, one Neon round trip.
+    result = await db.execute(
+        select(Chapter)
+        .join(Story, Story.id == Chapter.story_id)
+        .where(
+            Chapter.id == chapter_id,
+            Chapter.story_id == story_id,
+            Chapter.is_archived.is_(False),
+            Story.user_id == user.id,
+            Story.is_archived.is_(False),
+        )
+    )
+    chapter = result.scalar_one_or_none()
+    if chapter is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Chapter not found")
     return chapter

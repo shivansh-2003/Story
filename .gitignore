@@ -10,3 +10,4 @@ tests/
 .claude/
 .DS_Store
 README.html
+logs/

@@ -2,7 +2,10 @@ from enum import Enum
 
 from fastapi import HTTPException, status
 
+from app.core.logging_utils import log_execution
 
+
+@log_execution
 def assert_transition(current: Enum, new: Enum, allowed: dict) -> None:
     """Shared status-transition guard for both stories and chapters. `allowed`
     is a `{current_status: {reachable_statuses}}` map defined next to each

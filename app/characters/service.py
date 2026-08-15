@@ -6,9 +6,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.characters.models import Character, CharacterRelationship
 from app.characters.schemas import CharacterCreate, CharacterRelationshipCreate, CharacterUpdate
 from app.core.deps import get_owned_character
+from app.core.logging_utils import log_execution
 from app.users.models import User
 
 
+@log_execution
 async def list_characters(db: AsyncSession, user: User) -> list[Character]:
     result = await db.execute(
         select(Character).where(Character.user_id == user.id, Character.is_archived.is_(False))
@@ -16,6 +18,7 @@ async def list_characters(db: AsyncSession, user: User) -> list[Character]:
     return list(result.scalars().all())
 
 
+@log_execution
 async def create_character(db: AsyncSession, user: User, body: CharacterCreate) -> Character:
     character = Character(user_id=user.id, **body.model_dump())
     db.add(character)
@@ -24,6 +27,7 @@ async def create_character(db: AsyncSession, user: User, body: CharacterCreate) 
     return character
 
 
+@log_execution
 async def update_character(
     db: AsyncSession, user: User, character_id: uuid.UUID, body: CharacterUpdate
 ) -> Character:
@@ -35,12 +39,14 @@ async def update_character(
     return character
 
 
+@log_execution
 async def archive_character(db: AsyncSession, user: User, character_id: uuid.UUID) -> None:
     character = await get_owned_character(db, character_id, user)
     character.is_archived = True
     await db.commit()
 
 
+@log_execution
 async def list_relationships(
     db: AsyncSession, user: User, character_id: uuid.UUID
 ) -> list[CharacterRelationship]:
@@ -51,6 +57,7 @@ async def list_relationships(
     return list(result.scalars().all())
 
 
+@log_execution
 async def add_relationship(
     db: AsyncSession, user: User, character_id: uuid.UUID, body: CharacterRelationshipCreate
 ) -> CharacterRelationship:
@@ -64,6 +71,7 @@ async def add_relationship(
     return relationship
 
 
+@log_execution
 async def list_relationships_among(
     db: AsyncSession, character_ids: list[uuid.UUID]
 ) -> list[CharacterRelationship]:
@@ -72,6 +80,10 @@ async def list_relationships_among(
     actually active in the current chapter, not the writer's full cast."""
     if not character_ids:
         return []
+    # TODO: call log_cache_event here once a cache layer exists for this
+    # lookup — per the backend optimization plan, this is a caching
+    # candidate (same character set queried repeatedly within one chapter's
+    # writing session).
     result = await db.execute(
         select(CharacterRelationship).where(
             CharacterRelationship.character_id.in_(character_ids),

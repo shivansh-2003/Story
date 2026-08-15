@@ -1,4 +1,5 @@
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -7,11 +8,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.auth import router as auth
 from app.chapters import router as chapters
 from app.characters import router as characters
+from app.core.logging_config import setup_logging
 from app.database import Base, engine
 from app.generation import router as generation
 from app.stories import router as stories
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+setup_logging()
 logger = logging.getLogger("story_assistant")
 
 ALLOWED_ORIGINS = ["http://localhost:5173", "http://localhost:4173"]
@@ -52,6 +54,19 @@ async def log_disallowed_origins(request: Request, call_next):
             ALLOWED_ORIGINS,
         )
     return await call_next(request)
+
+
+@app.middleware("http")
+async def log_request_timing(request: Request, call_next):
+    # End-to-end per-request timing without decorating every route function
+    # individually — @log_execution covers the service layer, this covers
+    # the router boundary. Method, path, status, latency only — never the
+    # request/response body.
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    logger.info("%s %s -> %d (%.1fms)", request.method, request.url.path, response.status_code, elapsed_ms)
+    return response
 
 
 app.include_router(auth.router)

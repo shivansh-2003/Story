@@ -54,11 +54,11 @@ export function StoryDetailPage() {
   const [bibleForm, setBibleForm] = useState<StoryInput>(emptyBibleForm);
   const [bibleSaving, setBibleSaving] = useState(false);
 
-  async function refresh() {
+  async function refresh(signal?: AbortSignal) {
     const [storyDetail, chapterList, characters] = await Promise.all([
-      getStory(storyId),
-      listChapters(storyId),
-      listCharacters(),
+      getStory(storyId, signal),
+      listChapters(storyId, signal),
+      listCharacters(signal),
     ]);
     setStory(storyDetail);
     setChapters(chapterList);
@@ -66,7 +66,13 @@ export function StoryDetailPage() {
   }
 
   useEffect(() => {
-    refresh();
+    const controller = new AbortController();
+    // StrictMode double-invokes this effect in dev; aborting the first run's
+    // in-flight requests on cleanup avoids firing every fetch twice.
+    refresh(controller.signal).catch((err) => {
+      if ((err as Error).name !== "AbortError") throw err;
+    });
+    return () => controller.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storyId]);
 

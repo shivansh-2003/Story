@@ -2,12 +2,14 @@ import uuid
 
 from app.chapters.service import get_chapter_body, update_chapter_summary
 from app.core.llm_client import call_model
+from app.core.logging_utils import log_execution
 from app.database import async_session
 from app.generation import session_store
 
 COMPACTION_WORD_THRESHOLD = 700
 
 
+@log_execution
 async def maybe_compact_session(chapter_id: uuid.UUID) -> None:
     """Trigger 1 — intra-chapter, length-based.
     Called from the accept endpoint AFTER saving the session, fire-and-forget
@@ -41,6 +43,7 @@ async def maybe_compact_session(chapter_id: uuid.UUID) -> None:
         await update_chapter_summary(db, chapter_id, running_summary_cache=new_summary)
 
 
+@log_execution
 async def summarize_completed_chapter(chapter_id: uuid.UUID) -> None:
     """Trigger 2 — inter-chapter, event-based.
     Called on chapter status -> complete, AND on any edit to an already-complete

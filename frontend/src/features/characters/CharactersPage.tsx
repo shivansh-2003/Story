@@ -24,7 +24,13 @@ export function CharactersPage() {
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    listCharacters().then(setCharacters);
+    const controller = new AbortController();
+    listCharacters(controller.signal)
+      .then(setCharacters)
+      .catch((err) => {
+        if ((err as Error).name !== "AbortError") throw err;
+      });
+    return () => controller.abort();
   }, []);
 
   async function handleCreate(e: FormEvent) {

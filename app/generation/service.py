@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import uuid
 from collections.abc import AsyncIterator
@@ -7,8 +8,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.chapters.models import Chapter, ChapterStatus
-from app.chapters.service import get_prior_chapter_summaries, set_chapter_status
+from app.chapters.service import set_chapter_status
 from app.core.llm_client import stream_model
+from app.core.logging_utils import log_execution
 from app.database import async_session
 from app.generation import assembler, session_store, summarizer
 from app.generation.models import ChapterTurn
@@ -21,8 +23,9 @@ LENGTH_PRESETS = {"short": 50, "standard": 100, "long": 150}
 LENGTH_TOKEN_CEILINGS = {"short": 120, "standard": 220, "long": 320}
 
 
+@log_execution(label="PREPARE_PHASE")
 async def prepare_continue(
-    db: AsyncSession, chapter_id: uuid.UUID, story_id: uuid.UUID, instruction: str, length: str
+    db: AsyncSession, chapter: Chapter, story_id: uuid.UUID, instruction: str, length: str
 ) -> tuple[str, str, dict]:
     """DB-dependent prep for generate_continue — must run and finish before
     the router returns its StreamingResponse. FastAPI tears down `Depends(get_db)`
@@ -30,16 +33,26 @@ async def prepare_continue(
     immediately, before the generator body has run at all — so no DB access
     can happen inside the generator itself.
 
+    Takes the already-fetched Chapter (from the router's ownership check)
+    instead of a bare id, so the lock check and status write don't re-query
+    a row the caller already has.
+
     Returns (system, user, state)."""
-    await _guard_not_locked_and_mark_in_progress(db, chapter_id)
+    if chapter.status == ChapterStatus.locked:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Chapter is locked — unlock it before generating or editing.")
+    chapter_id = chapter.id
     state = await session_store.get_session(chapter_id)
-    prior_summaries = await get_prior_chapter_summaries(db, story_id, chapter_id)
-    system, user = await assembler.build_continue_prompt(
-        db, chapter_id, story_id, state, prior_summaries, instruction, LENGTH_PRESETS.get(length, 100)
+    # the in_progress status write doesn't gate prompt assembly — they touch
+    # unrelated data, so run them concurrently instead of paying the status
+    # UPDATE's round-trip before assembly even starts.
+    _, (system, user) = await asyncio.gather(
+        set_chapter_status(db, chapter_id, ChapterStatus.in_progress, chapter=chapter),
+        assembler.build_continue_prompt(chapter_id, story_id, state, instruction, LENGTH_PRESETS.get(length, 100)),
     )
     return system, user, state
 
 
+@log_execution(label="GENERATE")
 async def generate_continue(
     system: str, user: str, state: dict, chapter_id: uuid.UUID, instruction: str, length: str
 ) -> AsyncIterator[str]:
@@ -56,27 +69,27 @@ async def generate_continue(
     await _mark_in_review(chapter_id)
 
 
+@log_execution(label="PREPARE_PHASE")
 async def prepare_edit(
-    db: AsyncSession, chapter_id: uuid.UUID, story_id: uuid.UUID, instruction: str
+    db: AsyncSession, chapter: Chapter, story_id: uuid.UUID, instruction: str
 ) -> tuple[str, str, dict]:
     """Same DB-before-streaming constraint as prepare_continue. Also where
     "no pending turn to edit" (ValueError from the assembler) surfaces, so the
     router can still turn it into a normal 400 instead of a broken stream.
 
     Returns (system, user, state)."""
-    await _guard_not_locked_and_mark_in_progress(db, chapter_id)
+    if chapter.status == ChapterStatus.locked:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Chapter is locked — unlock it before generating or editing.")
+    chapter_id = chapter.id
     state = await session_store.get_session(chapter_id)
-    system, user = await assembler.build_edit_prompt(db, chapter_id, story_id, state, instruction)
+    _, (system, user) = await asyncio.gather(
+        set_chapter_status(db, chapter_id, ChapterStatus.in_progress, chapter=chapter),
+        assembler.build_edit_prompt(chapter_id, story_id, state, instruction),
+    )
     return system, user, state
 
 
-async def _guard_not_locked_and_mark_in_progress(db: AsyncSession, chapter_id: uuid.UUID) -> None:
-    chapter = await db.get(Chapter, chapter_id)
-    if chapter.status == ChapterStatus.locked:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Chapter is locked — unlock it before generating or editing.")
-    await set_chapter_status(db, chapter_id, ChapterStatus.in_progress)
-
-
+@log_execution(label="EDIT")
 async def edit_pending(
     system: str, user: str, state: dict, chapter_id: uuid.UUID, instruction: str
 ) -> AsyncIterator[str]:
@@ -93,6 +106,7 @@ async def edit_pending(
     await _mark_in_review(chapter_id)
 
 
+@log_execution
 async def _mark_in_review(chapter_id: uuid.UUID) -> None:
     # runs after the streaming response has already sent its content, so the
     # request's own db session (torn down when the router returned) can't be
@@ -107,6 +121,7 @@ async def _mark_in_review(chapter_id: uuid.UUID) -> None:
         logger.warning("failed to mark chapter %s as in_review", chapter_id, exc_info=True)
 
 
+@log_execution
 async def apply_manual_edit(chapter_id: uuid.UUID, new_content: str) -> dict:
     """User hand-edits the pending draft directly — no model call."""
     state = await session_store.get_session(chapter_id)
@@ -115,7 +130,9 @@ async def apply_manual_edit(chapter_id: uuid.UUID, new_content: str) -> dict:
     return state["pending_turn"]
 
 
-async def accept_pending(db: AsyncSession, chapter_id: uuid.UUID, background_tasks: BackgroundTasks) -> dict:
+@log_execution
+async def accept_pending(db: AsyncSession, chapter: Chapter, background_tasks: BackgroundTasks) -> dict:
+    chapter_id = chapter.id
     state = await session_store.get_session(chapter_id)
     if state["pending_turn"] is None:
         raise ValueError("Nothing to accept")
@@ -129,34 +146,39 @@ async def accept_pending(db: AsyncSession, chapter_id: uuid.UUID, background_tas
     turn = ChapterTurn(chapter_id=chapter_id, sequence=next_sequence, content=content, instruction=instruction)
     db.add(turn)
     await db.commit()
+    await session_store.invalidate_chapter_body(chapter_id)
 
     state["raw_tail"].append(content)
     state["word_count_since_compaction"] += len(content.split())
     state["pending_turn"] = None
     state["sibling_attempts"] = []
     await session_store.save_session(chapter_id, state)
-    await set_chapter_status(db, chapter_id, ChapterStatus.in_progress)
+    await set_chapter_status(db, chapter_id, ChapterStatus.in_progress, chapter=chapter)
 
     background_tasks.add_task(summarizer.maybe_compact_session, chapter_id)
     return {"accepted": True, "sequence": next_sequence}
 
 
-async def discard_pending(db: AsyncSession, chapter_id: uuid.UUID) -> None:
+@log_execution
+async def discard_pending(db: AsyncSession, chapter: Chapter) -> None:
+    chapter_id = chapter.id
     state = await session_store.get_session(chapter_id)
     state["pending_turn"] = None
     await session_store.save_session(chapter_id, state)
 
     has_turns = await db.scalar(select(ChapterTurn.id).where(ChapterTurn.chapter_id == chapter_id).limit(1))
     new_status = ChapterStatus.in_progress if has_turns else ChapterStatus.draft
-    await set_chapter_status(db, chapter_id, new_status)
+    await set_chapter_status(db, chapter_id, new_status, chapter=chapter)
 
 
-async def complete_chapter(db: AsyncSession, chapter_id: uuid.UUID, background_tasks: BackgroundTasks) -> dict:
+@log_execution
+async def complete_chapter(db: AsyncSession, chapter: Chapter, background_tasks: BackgroundTasks) -> dict:
+    chapter_id = chapter.id
     state = await session_store.get_session(chapter_id)
     if state["pending_turn"] is not None:
         # explicit rule: block, don't silently discard or include
         raise ValueError("Resolve the pending draft (accept or discard) before completing the chapter")
 
-    await set_chapter_status(db, chapter_id, ChapterStatus.complete)
+    await set_chapter_status(db, chapter_id, ChapterStatus.complete, chapter=chapter)
     background_tasks.add_task(summarizer.summarize_completed_chapter, chapter_id)
     return {"status": "complete", "summarizing": True}

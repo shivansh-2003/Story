@@ -11,7 +11,8 @@ export type ChapterUpdateInput = ChapterInput & {
   summary?: string | null;
 };
 
-export const listChapters = (storyId: UUID) => apiFetch<Chapter[]>(`/stories/${storyId}/chapters`);
+export const listChapters = (storyId: UUID, signal?: AbortSignal) =>
+  apiFetch<Chapter[]>(`/stories/${storyId}/chapters`, { signal });
 
 export const createChapter = (storyId: UUID, body: ChapterInput) =>
   apiFetch<Chapter>(`/stories/${storyId}/chapters`, { method: "POST", body });
