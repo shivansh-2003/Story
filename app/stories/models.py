@@ -23,15 +23,31 @@ class Tense(str, enum.Enum):
 class StoryStatus(str, enum.Enum):
     draft = "draft"
     ongoing = "ongoing"
+    on_hold = "on_hold"
     completed = "completed"
     abandoned = "abandoned"
+
+
+# allow-list of reachable next statuses per current status — enforced by
+# app.core.status.assert_transition, called from both the generic PATCH path
+# and any explicit status-setting service function. Story `completed` is
+# manual-only by design (never auto-derived from chapter statuses).
+STORY_TRANSITIONS: dict[StoryStatus, set[StoryStatus]] = {
+    StoryStatus.draft: {StoryStatus.ongoing, StoryStatus.abandoned},
+    StoryStatus.ongoing: {StoryStatus.on_hold, StoryStatus.completed, StoryStatus.abandoned},
+    StoryStatus.on_hold: {StoryStatus.ongoing, StoryStatus.completed, StoryStatus.abandoned},
+    StoryStatus.completed: {StoryStatus.ongoing},  # explicit reopen
+    StoryStatus.abandoned: {StoryStatus.ongoing},  # explicit reopen
+}
 
 
 class Story(Base):
     __tablename__ = "stories"
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True
+    )
     title: Mapped[str] = mapped_column(Text, nullable=False)
     genre: Mapped[list[str] | None] = mapped_column(ARRAY(String))
     tone: Mapped[str | None] = mapped_column(Text)

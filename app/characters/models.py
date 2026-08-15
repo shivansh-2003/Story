@@ -12,7 +12,9 @@ class Character(Base):
     __tablename__ = "characters"
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True
+    )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     role: Mapped[str | None] = mapped_column(Text)
     age: Mapped[str | None] = mapped_column(Text)
@@ -38,9 +40,9 @@ class CharacterRelationship(Base):
 
     id: Mapped[uuid.UUID] = uuid_pk()
     character_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("characters.id"), nullable=False
+        UUID(as_uuid=True), ForeignKey("characters.id"), nullable=False, index=True
     )
     related_character_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("characters.id"), nullable=False
+        UUID(as_uuid=True), ForeignKey("characters.id"), nullable=False, index=True
     )
     relationship_label: Mapped[str | None] = mapped_column(Text)

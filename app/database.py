@@ -14,6 +14,8 @@ connect_args = {"ssl": "require"} if settings.database_ssl_require else {}
 engine = create_async_engine(
     settings.database_url,
     pool_size=5,
+    pool_pre_ping=True,  # Neon drops idle connections; check liveness before handing one out
+    pool_recycle=300,  # proactively retire connections before Neon's idle timeout
     connect_args=connect_args,
 )
 

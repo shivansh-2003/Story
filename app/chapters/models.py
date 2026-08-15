@@ -12,14 +12,32 @@ from app.database import Base, uuid_pk
 class ChapterStatus(str, enum.Enum):
     draft = "draft"
     in_progress = "in_progress"
+    in_review = "in_review"
     complete = "complete"
+    locked = "locked"
+
+
+# allow-list of reachable next statuses per current status — enforced by
+# app.core.status.assert_transition. `complete` and `locked` cannot be reached
+# via generic PATCH (see chapters/service.py:update_chapter) since they carry
+# side effects (summarization, edit-protection) that a bare field write would
+# skip — only the dedicated /complete, /lock, /unlock paths reach them.
+CHAPTER_TRANSITIONS: dict[ChapterStatus, set[ChapterStatus]] = {
+    ChapterStatus.draft: {ChapterStatus.in_progress},
+    ChapterStatus.in_progress: {ChapterStatus.in_review, ChapterStatus.complete, ChapterStatus.draft},
+    ChapterStatus.in_review: {ChapterStatus.in_progress, ChapterStatus.draft},
+    ChapterStatus.complete: {ChapterStatus.in_progress, ChapterStatus.locked},
+    ChapterStatus.locked: {ChapterStatus.complete},
+}
 
 
 class Chapter(Base):
     __tablename__ = "chapters"
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    story_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("stories.id"), nullable=False)
+    story_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("stories.id"), nullable=False, index=True
+    )
     order_index: Mapped[int] = mapped_column(Integer, nullable=False)
     title: Mapped[str | None] = mapped_column(Text)
     status: Mapped[ChapterStatus] = mapped_column(

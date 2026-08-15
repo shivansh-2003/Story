@@ -34,8 +34,8 @@ export type CharacterRelationship = {
 
 export type POV = "first_person" | "third_limited" | "third_omniscient";
 export type Tense = "past" | "present";
-export type StoryStatus = "draft" | "ongoing" | "completed" | "abandoned";
-export type ChapterStatus = "draft" | "in_progress" | "complete";
+export type StoryStatus = "draft" | "ongoing" | "on_hold" | "completed" | "abandoned";
+export type ChapterStatus = "draft" | "in_progress" | "in_review" | "complete" | "locked";
 
 export type Story = {
   id: UUID;

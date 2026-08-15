@@ -75,3 +75,18 @@ async def remove_active_character(
     story_id: uuid.UUID, chapter_id: uuid.UUID, character_id: uuid.UUID, db: DbSession, current_user: CurrentUser
 ) -> None:
     await service.remove_active_character(db, current_user, story_id, chapter_id, character_id)
+
+
+@router.post("/{chapter_id}/lock", status_code=status.HTTP_204_NO_CONTENT)
+async def lock_chapter(story_id: uuid.UUID, chapter_id: uuid.UUID, db: DbSession, current_user: CurrentUser) -> None:
+    """Deliberately a dedicated endpoint, not a PATCH status write — locking
+    is meant to be a visible, intentional act, not a side effect of a bulk
+    field update."""
+    await service.lock_chapter(db, current_user, story_id, chapter_id)
+
+
+@router.post("/{chapter_id}/unlock", status_code=status.HTTP_204_NO_CONTENT)
+async def unlock_chapter(
+    story_id: uuid.UUID, chapter_id: uuid.UUID, db: DbSession, current_user: CurrentUser
+) -> None:
+    await service.unlock_chapter(db, current_user, story_id, chapter_id)

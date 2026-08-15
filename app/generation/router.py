@@ -7,7 +7,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 from fastapi.responses import StreamingResponse
 
 from app.core.deps import CurrentUser, DbSession, get_owned_chapter
-from app.generation import service
+from app.generation import service, summarizer
 from app.generation.schemas import EditRequest, GenerateRequest, ManualEditRequest, TurnOut
 
 router = APIRouter(prefix="/stories/{story_id}/chapters/{chapter_id}", tags=["generation"])
@@ -39,8 +39,8 @@ async def generate(
     current_user: CurrentUser,
 ) -> StreamingResponse:
     await get_owned_chapter(db, story_id, chapter_id, current_user)
-    prompt, state = await service.prepare_continue(db, chapter_id, story_id, body.instruction, body.length)
-    stream = service.generate_continue(prompt, state, chapter_id, body.instruction)
+    system, user, state = await service.prepare_continue(db, chapter_id, story_id, body.instruction, body.length)
+    stream = service.generate_continue(system, user, state, chapter_id, body.instruction, body.length)
     return StreamingResponse(_sse(stream), media_type="text/event-stream")
 
 
@@ -57,10 +57,10 @@ async def generate_edit(
     discard hand-edits" without extra branching at the call site."""
     await get_owned_chapter(db, story_id, chapter_id, current_user)
     try:
-        prompt, state = await service.prepare_edit(db, chapter_id, story_id, body.instruction)
+        system, user, state = await service.prepare_edit(db, chapter_id, story_id, body.instruction)
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
-    stream = service.edit_pending(prompt, state, chapter_id, body.instruction)
+    stream = service.edit_pending(system, user, state, chapter_id, body.instruction)
     return StreamingResponse(_sse(stream), media_type="text/event-stream")
 
 
@@ -94,7 +94,7 @@ async def accept(
 @router.post("/discard")
 async def discard(story_id: uuid.UUID, chapter_id: uuid.UUID, db: DbSession, current_user: CurrentUser) -> dict:
     await get_owned_chapter(db, story_id, chapter_id, current_user)
-    await service.discard_pending(chapter_id)
+    await service.discard_pending(db, chapter_id)
     return {"discarded": True}
 
 
@@ -111,3 +111,21 @@ async def complete(
         return await service.complete_chapter(db, chapter_id, background_tasks)
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+
+
+@router.post("/resummarize")
+async def resummarize(
+    story_id: uuid.UUID,
+    chapter_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> dict:
+    """Manual escape hatch for a chapter_summary that never landed (e.g. the
+    LLM call failed after retries exhausted) — re-runs the same background
+    job /complete already schedules. Safe to call on any chapter regardless
+    of current status; the job falls back to reconstructing from durable
+    chapter_turns when there's no live Redis session to summarize from."""
+    await get_owned_chapter(db, story_id, chapter_id, current_user)
+    background_tasks.add_task(summarizer.summarize_completed_chapter, chapter_id)
+    return {"summarizing": True}

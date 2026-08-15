@@ -6,7 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.characters.models import Character
 from app.core.deps import get_owned_character, get_owned_story
-from app.stories.models import Story, StoryCharacter
+from app.core.status import assert_transition
+from app.stories.models import STORY_TRANSITIONS, Story, StoryCharacter
 from app.stories.schemas import StoryCreate, StoryUpdate
 from app.users.models import User
 
@@ -37,7 +38,10 @@ async def imported_characters(db: AsyncSession, story_id: uuid.UUID) -> list[Cha
 
 async def update_story(db: AsyncSession, user: User, story_id: uuid.UUID, body: StoryUpdate) -> Story:
     story = await get_owned_story(db, story_id, user)
-    for field, value in body.model_dump(exclude_unset=True).items():
+    fields = body.model_dump(exclude_unset=True)
+    if "status" in fields:
+        assert_transition(story.status, fields["status"], STORY_TRANSITIONS)
+    for field, value in fields.items():
         setattr(story, field, value)
     await db.commit()
     await db.refresh(story)

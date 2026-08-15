@@ -4,13 +4,19 @@ from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.chapters.models import Chapter, ChapterCharacter, ChapterStatus
+from app.chapters.models import CHAPTER_TRANSITIONS, Chapter, ChapterCharacter, ChapterStatus
 from app.chapters.schemas import ChapterCreate, ChapterReorderRequest, ChapterUpdate
 from app.characters.models import Character
 from app.characters.schemas import CharacterCreate
 from app.core.deps import get_owned_chapter, get_owned_character, get_owned_story
+from app.core.status import assert_transition
 from app.generation.models import ChapterTurn
 from app.users.models import User
+
+# statuses reachable only through a dedicated endpoint (POST /complete,
+# /lock) because they carry side effects a bare PATCH shouldn't trigger —
+# summarization for complete, edit-protection for locked.
+_PATCH_PROTECTED_STATUSES = {ChapterStatus.complete, ChapterStatus.locked}
 
 
 async def list_chapters(db: AsyncSession, user: User, story_id: uuid.UUID) -> list[Chapter]:
@@ -42,8 +48,18 @@ async def reorder_chapters(
 ) -> None:
     await get_owned_story(db, story_id, user)
 
+    chapter_ids = [item.chapter_id for item in body.items]
+    result = await db.execute(
+        select(Chapter).where(
+            Chapter.story_id == story_id, Chapter.id.in_(chapter_ids), Chapter.is_archived.is_(False)
+        )
+    )
+    chapters_by_id = {c.id: c for c in result.scalars().all()}
+
     for item in body.items:
-        chapter = await get_owned_chapter(db, story_id, item.chapter_id, user)
+        chapter = chapters_by_id.get(item.chapter_id)
+        if chapter is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Chapter not found")
         chapter.order_index = item.order_index
 
     await db.commit()
@@ -60,7 +76,16 @@ async def update_chapter(
     db: AsyncSession, user: User, story_id: uuid.UUID, chapter_id: uuid.UUID, body: ChapterUpdate
 ) -> Chapter:
     chapter = await get_owned_chapter(db, story_id, chapter_id, user)
-    for field, value in body.model_dump(exclude_unset=True).items():
+    fields = body.model_dump(exclude_unset=True)
+    if "status" in fields:
+        new_status = fields["status"]
+        if new_status in _PATCH_PROTECTED_STATUSES and new_status != chapter.status:
+            endpoint = "complete" if new_status == ChapterStatus.complete else "lock"
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, f"Use the /{endpoint} endpoint to transition to {new_status.value}"
+            )
+        assert_transition(chapter.status, new_status, CHAPTER_TRANSITIONS)
+    for field, value in fields.items():
         setattr(chapter, field, value)
     await db.commit()
     await db.refresh(chapter)
@@ -160,5 +185,16 @@ async def update_chapter_summary(
 
 async def set_chapter_status(db: AsyncSession, chapter_id: uuid.UUID, new_status: ChapterStatus) -> None:
     chapter = await db.get(Chapter, chapter_id)
+    assert_transition(chapter.status, new_status, CHAPTER_TRANSITIONS)
     chapter.status = new_status
     await db.commit()
+
+
+async def lock_chapter(db: AsyncSession, user: User, story_id: uuid.UUID, chapter_id: uuid.UUID) -> None:
+    await get_owned_chapter(db, story_id, chapter_id, user)
+    await set_chapter_status(db, chapter_id, ChapterStatus.locked)
+
+
+async def unlock_chapter(db: AsyncSession, user: User, story_id: uuid.UUID, chapter_id: uuid.UUID) -> None:
+    await get_owned_chapter(db, story_id, chapter_id, user)
+    await set_chapter_status(db, chapter_id, ChapterStatus.complete)

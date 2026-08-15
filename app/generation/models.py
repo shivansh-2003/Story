@@ -15,7 +15,9 @@ class ChapterTurn(Base):
     __tablename__ = "chapter_turns"
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    chapter_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("chapters.id"), nullable=False)
+    chapter_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("chapters.id"), nullable=False, index=True
+    )
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     instruction: Mapped[str | None] = mapped_column(Text)

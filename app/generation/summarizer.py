@@ -19,8 +19,10 @@ async def maybe_compact_session(chapter_id: uuid.UUID) -> None:
 
     # everything except the last 1-2 paragraphs (which stay as raw_tail) gets folded in
     to_compact = state["raw_tail"][:-2] if len(state["raw_tail"]) > 2 else []
-    if not to_compact and not state["running_summary"]:
-        return  # nothing to do yet
+    if not to_compact:
+        # nothing new to fold in — calling the model here would just pay for a
+        # paraphrase of the existing summary (and risk it drifting) for no reason.
+        return
 
     prompt = (
         f"Existing summary: {state['running_summary'] or '(none yet)'}\n"
