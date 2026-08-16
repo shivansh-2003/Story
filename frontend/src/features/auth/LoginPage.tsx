@@ -1,65 +1,84 @@
-import { useState, type FormEvent } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useState } from "react";
+import { Link, Navigate, useNavigate } from "react-router-dom";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
 import { useAuth } from "@/lib/auth";
-import styles from "@/styles/shared.module.css";
+import { AuthLayout } from "@/components/shells/AuthLayout";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
+import { loginSchema, authErrorMessage, type LoginValues } from "./schemas";
 
 export function LoginPage() {
-  const { login } = useAuth();
+  const { login, status } = useAuth();
   const navigate = useNavigate();
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [serverError, setServerError] = useState<string | null>(null);
+  const form = useForm<LoginValues>({
+    resolver: zodResolver(loginSchema),
+    defaultValues: { email: "", password: "" },
+  });
 
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    setBusy(true);
-    setError(null);
+  if (status === "signed-in") return <Navigate to="/library" replace />;
+
+  async function onSubmit(values: LoginValues) {
+    setServerError(null);
     try {
-      await login(email, password);
-      navigate("/");
+      await login(values.email, values.password);
+      navigate("/library");
     } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
+      setServerError(authErrorMessage(err, "login"));
     }
   }
 
   return (
-    <div className={styles.authPage}>
-      <div className={styles.authCard}>
-        <h1 className={styles.authTitle}>Welcome back</h1>
-        <p className={styles.authSubtitle}>Sign in to your writing room.</p>
-        <form className={styles.plainForm} onSubmit={handleSubmit}>
-          <label className={styles.label}>
-            Email
-            <input
-              className={styles.input}
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              required
-            />
-          </label>
-          <label className={styles.label}>
-            Password
-            <input
-              className={styles.input}
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-            />
-          </label>
-          {error && <span className={styles.errorText}>{error}</span>}
-          <button className={styles.primaryBtn} type="submit" disabled={busy}>
-            {busy ? "Signing in…" : "Sign in"}
-          </button>
+    <AuthLayout>
+      <h1 className="font-display text-2xl font-medium">Welcome back</h1>
+      <p className="mt-1 text-sm text-muted-foreground">Pick up where the draft is.</p>
+
+      <Form {...form}>
+        <form className="mt-6 space-y-4" onSubmit={form.handleSubmit(onSubmit)}>
+          <FormField
+            control={form.control}
+            name="email"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Email</FormLabel>
+                <FormControl>
+                  <Input type="email" autoComplete="email" inputMode="email" autoFocus {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="password"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Password</FormLabel>
+                <FormControl>
+                  <Input type="password" autoComplete="current-password" {...field} />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+
+          {serverError && (
+            <p role="alert" className="font-mono text-xs uppercase tracking-wide text-destructive">
+              {serverError}
+            </p>
+          )}
+
+          <Button type="submit" className="w-full" disabled={form.formState.isSubmitting}>
+            {form.formState.isSubmitting ? "Signing in…" : "Sign in"}
+          </Button>
         </form>
-        <div className={styles.authSwitch}>
-          No account? <Link to="/signup">Create one</Link>
-        </div>
-      </div>
-    </div>
+      </Form>
+
+      <p className="mt-6 text-sm text-muted-foreground">
+        No account? <Link to="/signup" className="text-primary hover:underline">Create one</Link>
+      </p>
+    </AuthLayout>
   );
 }

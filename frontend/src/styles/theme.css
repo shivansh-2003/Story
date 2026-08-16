@@ -1,0 +1,66 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "./tokens.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: rgb(var(--background));
+  --color-foreground: rgb(var(--foreground));
+  --color-card: rgb(var(--card));
+  --color-card-foreground: rgb(var(--card-foreground));
+  --color-popover: rgb(var(--popover));
+  --color-popover-foreground: rgb(var(--popover-foreground));
+  --color-primary: rgb(var(--primary));
+  --color-primary-foreground: rgb(var(--primary-foreground));
+  --color-secondary: rgb(var(--secondary));
+  --color-secondary-foreground: rgb(var(--secondary-foreground));
+  --color-muted: rgb(var(--muted));
+  --color-muted-foreground: rgb(var(--muted-foreground));
+  --color-accent: rgb(var(--accent));
+  --color-accent-foreground: rgb(var(--accent-foreground));
+  --color-destructive: rgb(var(--destructive));
+  --color-destructive-foreground: rgb(var(--destructive-foreground));
+  --color-border: rgb(var(--border));
+  --color-input: rgb(var(--input));
+  --color-ring: rgb(var(--ring));
+
+  --color-marigold: rgb(var(--marigold));
+  --color-graphite: rgb(var(--graphite));
+  --color-sheet: rgb(var(--sheet));
+  --color-sheet-foreground: rgb(var(--sheet-foreground));
+  --color-sheet-rule: rgb(var(--sheet-rule));
+  --color-sheet-margin: rgb(var(--sheet-margin));
+  --color-pending: rgb(var(--pending));
+
+  --font-display: "Cabinet Grotesk", "Archivo", system-ui, sans-serif;
+  --font-sans: "Switzer", ui-sans-serif, system-ui, sans-serif;
+  --font-manuscript: "Newsreader", ui-serif, Georgia, serif;
+  --font-mono: "Spline Sans Mono", ui-monospace, monospace;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 6px);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground font-sans;
+  }
+}
+
+@layer utilities {
+  /* Same drain-the-blue-out-left-to-right mechanism as the galley's
+     ink-settle, generalized to chrome text (foreground/primary instead of
+     the sheet's ink/pending tokens) — see inkSettle.ts. */
+  .ink-sweep {
+    background: linear-gradient(90deg, rgb(var(--foreground)) var(--sweep, 0%), rgb(var(--nonrepro)) var(--sweep, 0%));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+}

@@ -71,11 +71,25 @@ async def reorder_chapters(
     )
     chapters_by_id = {c.id: c for c in result.scalars().all()}
 
+    ordered: list[tuple[Chapter, int]] = []
     for item in body.items:
         chapter = chapters_by_id.get(item.chapter_id)
         if chapter is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Chapter not found")
-        chapter.order_index = item.order_index
+        ordered.append((chapter, item.order_index))
+
+    # uq_chapter_order_per_story isn't deferrable, so Postgres checks it per
+    # statement, not at commit. Writing final indices directly can collide
+    # mid-transaction whenever two chapters swap positions — e.g. 0<->1: the
+    # UPDATE claiming index 1 can run before the chapter currently there has
+    # vacated it. Stage through temporary negative indices (always unique,
+    # never overlap the real 0..n-1 range) so every row clears its old slot
+    # before any row claims its new one.
+    for i, (chapter, _) in enumerate(ordered):
+        chapter.order_index = -(i + 1)
+    await db.flush()
+    for chapter, order_index in ordered:
+        chapter.order_index = order_index
 
     await db.commit()
 

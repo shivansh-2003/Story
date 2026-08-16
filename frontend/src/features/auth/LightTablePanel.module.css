@@ -1,0 +1,52 @@
+.panel {
+  position: relative;
+  display: flex;
+  height: 100%;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1.5rem;
+  padding: 4rem;
+  background: radial-gradient(ellipse at 30% 20%, rgb(var(--stock)) 0%, rgb(var(--well)) 70%);
+}
+
+.sheet {
+  border-radius: var(--radius-xl);
+  background: rgb(var(--sheet));
+  box-shadow: var(--shadow-sheet);
+  padding: 2.5rem;
+  max-width: 30rem;
+}
+
+.line {
+  font-family: var(--font-manuscript);
+  font-size: 1.1875rem;
+  line-height: 1.78;
+  color: rgb(var(--pending));
+  animation: settle 9s ease-in-out infinite;
+}
+
+.attribution {
+  margin-top: 1rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  color: rgb(var(--sheet-margin));
+}
+
+@keyframes settle {
+  0%,
+  55% {
+    color: rgb(var(--pending));
+  }
+  75%,
+  100% {
+    color: rgb(var(--sheet-foreground));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .line {
+    animation: none;
+    color: rgb(var(--sheet-foreground));
+  }
+}

@@ -1,4 +1,4 @@
-@import "./tokens.css";
+@import "./theme.css";
 
 *,
 *::before,
@@ -14,9 +14,6 @@ body,
 
 body {
   margin: 0;
-  background: var(--ink-black);
-  color: var(--cream);
-  font-family: var(--font-manuscript);
   -webkit-font-smoothing: antialiased;
 }
 
@@ -24,37 +21,11 @@ h1,
 h2,
 h3 {
   font-family: var(--font-display);
-  font-weight: 600;
   margin: 0;
 }
 
 p {
   margin: 0;
-}
-
-button {
-  font-family: var(--font-mono);
-  cursor: pointer;
-}
-
-button:disabled {
-  cursor: default;
-  opacity: 0.5;
-}
-
-textarea,
-input {
-  font-family: inherit;
-  color: inherit;
-}
-
-a {
-  color: var(--brass-bright);
-}
-
-:focus-visible {
-  outline: 2px solid var(--brass-bright);
-  outline-offset: 2px;
 }
 
 @media (prefers-reduced-motion: reduce) {

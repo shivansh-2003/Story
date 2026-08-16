@@ -29,6 +29,14 @@ export const archiveChapter = (storyId: UUID, chapterId: UUID) =>
 export const reorderChapters = (storyId: UUID, items: { chapter_id: UUID; order_index: number }[]) =>
   apiFetch<void>(`/stories/${storyId}/chapters/reorder`, { method: "PATCH", body: { items } });
 
+// Dedicated endpoints, not a PATCH status write — see the backend router's
+// note: locking is a visible, intentional act.
+export const lockChapter = (storyId: UUID, chapterId: UUID) =>
+  apiFetch<void>(`/stories/${storyId}/chapters/${chapterId}/lock`, { method: "POST" });
+
+export const unlockChapter = (storyId: UUID, chapterId: UUID) =>
+  apiFetch<void>(`/stories/${storyId}/chapters/${chapterId}/unlock`, { method: "POST" });
+
 export const addActiveCharacter = (storyId: UUID, chapterId: UUID, characterId: UUID) =>
   apiFetch<void>(`/stories/${storyId}/chapters/${chapterId}/characters`, {
     method: "POST",

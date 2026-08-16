@@ -1,48 +1,71 @@
-:root {
-  /* the desk — dark chrome that frames the page */
-  --ink-black: #1c1a17;
-  --panel: #242019;
-  --panel-raised: #2c2720;
-  --panel-border: #3c362b;
+@layer base {
+  :root {
+    /* raw palette — non-photo blue pencil vs. iron ink, see design spec */
+    --slate: 14 30 36; /* #0E1E24 */
+    --well: 7 18 22;
+    --stock: 22 48 58;
+    --paper: 246 242 233;
+    --ink: 20 24 27;
+    --nonrepro: 88 191 224;
+    --marigold: 232 160 32;
+    --vermilion: 217 67 47;
+    --graphite: 145 164 173;
 
-  /* the page — lamp-lit paper, the one bright surface in the room */
-  --paper: #f3ead9;
-  --paper-shadow: #e7dabf;
-  --ink: #2b2118;
-  --ink-muted: #6b5c48;
+    /* semantic — dark is the default shell */
+    --background: var(--slate);
+    --foreground: 237 243 245;
+    --card: var(--stock);
+    --card-foreground: 237 243 245;
+    --popover: var(--well);
+    --popover-foreground: 237 243 245;
+    --primary: var(--nonrepro);
+    --primary-foreground: var(--well);
+    --secondary: 30 60 72;
+    --secondary-foreground: 214 228 234;
+    --muted: 24 52 62;
+    --muted-foreground: var(--graphite);
+    --accent: 30 60 72;
+    --accent-foreground: var(--nonrepro);
+    --destructive: var(--vermilion);
+    --destructive-foreground: 255 248 246;
+    --border: 38 70 82;
+    --input: 38 70 82;
+    --ring: var(--nonrepro);
 
-  /* the lamp — primary accent, warm brass */
-  --brass: #c98a34;
-  --brass-bright: #e0a04a;
-  --brass-dim: #8a611f;
+    /* manuscript surface — inverted island */
+    --sheet: var(--paper);
+    --sheet-foreground: var(--ink);
+    --sheet-rule: 208 199 181;
+    --sheet-margin: 163 154 137;
+    --pending: 29 127 160; /* darkened non-repro for AA on paper (5.4:1) */
+    --pending-wash: 88 191 224;
 
-  /* the pencil — provisional, not-yet-accepted AI text */
-  --pencil: #64707c;
-  --pencil-bright: #8894a0;
-  --pencil-wash: #dfe0da;
+    --radius: 0.625rem;
 
-  /* text on the dark chrome */
-  --cream: #ece5d8;
-  --cream-muted: #a89e8c;
-  --cream-faint: #6f6656;
+    --shadow-raised: 0 1px 0 rgb(255 255 255 / 0.04) inset, 0 2px 8px rgb(7 18 22 / 0.4);
+    --shadow-sheet: 0 0 0 1px rgb(0 0 0 / 0.06), 0 24px 60px -20px rgb(7 18 22 / 0.75),
+      0 2px 0 rgb(255 255 255 / 0.5) inset;
 
-  --danger: #c1594c;
-  --danger-bg: #3a2620;
+    --dur-tap: 120ms;
+    --dur-quick: 200ms;
+    --dur-move: 320ms;
+    --dur-page: 420ms;
+    --dur-ink: 620ms;
+    --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+    --ease-settle: cubic-bezier(0.16, 0.84, 0.3, 1);
+  }
 
-  --font-display: "Fraunces", "Iowan Old Style", serif;
-  --font-manuscript: "Source Serif 4", "Iowan Old Style", Georgia, serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", monospace;
-
-  --space-1: 0.25rem;
-  --space-2: 0.5rem;
-  --space-3: 0.75rem;
-  --space-4: 1rem;
-  --space-6: 1.5rem;
-  --space-8: 2rem;
-  --space-12: 3rem;
-
-  --radius-sm: 3px;
-  --radius-md: 6px;
-
-  --shadow-page: 0 1px 2px rgba(0, 0, 0, 0.4), 0 20px 48px -20px rgba(0, 0, 0, 0.7);
+  /* Light mode: chrome becomes proof stock, sheet becomes bright white.
+     The blue/ink rule is unchanged — that's the point of it. */
+  [data-theme="light"] {
+    --background: 237 233 222;
+    --foreground: var(--ink);
+    --card: 250 248 243;
+    --card-foreground: var(--ink);
+    --muted-foreground: 106 118 124;
+    --border: 214 206 190;
+    --primary: 26 122 154;
+    --primary-foreground: 255 255 255;
+    --sheet: 255 253 249;
+  }
 }

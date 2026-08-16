@@ -1,0 +1,57 @@
+/* Two alternating section tints, never a third — segments the page for the
+   eye without breaking the "two colours only" rule from the design spec. */
+.tintA {
+  background: rgb(var(--slate));
+}
+.tintB {
+  background: color-mix(in srgb, rgb(var(--well)) 55%, rgb(var(--slate)));
+}
+
+/* Top padding only, deliberately — padding doesn't collapse like margin,
+   so a section carrying both top and bottom would stack with its neighbour
+   into a double-wide gap at every boundary (8rem, not 4rem). Top-only means
+   the gap between any two sections is a single 4rem, owned by the one
+   below. The last section before the footer adds its own bottom pad. */
+.section {
+  padding-top: 4rem; /* Tailwind's space-16 */
+}
+@media (max-width: 767px) {
+  .section {
+    padding-top: 2.5rem; /* Tailwind's space-10 */
+  }
+}
+
+.sectionEnd {
+  padding-bottom: 4rem;
+}
+@media (max-width: 767px) {
+  .sectionEnd {
+    padding-bottom: 2.5rem;
+  }
+}
+
+.connectorBase {
+  background: rgb(var(--graphite) / 0.2);
+}
+.connectorFill {
+  background: rgb(var(--nonrepro));
+  transform-origin: left center;
+}
+
+.underline {
+  background: rgb(var(--nonrepro));
+  height: 2px;
+  border-radius: 1px;
+}
+
+/* the closing CTA's hover ring — an SVG rect traced via pathLength, see
+   ClosingCTA.tsx */
+.ringButton {
+  position: relative;
+}
+.ringSvg {
+  position: absolute;
+  inset: -6px;
+  pointer-events: none;
+  overflow: visible;
+}

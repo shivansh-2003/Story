@@ -68,12 +68,17 @@ type StreamEvent = { delta?: string; done?: boolean; error?: string };
 /** POST + read a `text/event-stream` body, invoking onDelta per chunk as it
  * arrives. Separate from apiFetch since the response here is never a single
  * JSON body — used by the generation endpoints only. */
-export async function apiStream(path: string, body: unknown, onDelta: (delta: string) => void): Promise<void> {
+export async function apiStream(
+  path: string,
+  body: unknown,
+  onDelta: (delta: string) => void,
+  signal?: AbortSignal,
+): Promise<void> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   const token = getToken();
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
-  const response = await fetch(BASE_URL + path, { method: "POST", headers, body: JSON.stringify(body) });
+  const response = await fetch(BASE_URL + path, { method: "POST", headers, body: JSON.stringify(body), signal });
 
   if (response.status === 401) {
     clearToken();
