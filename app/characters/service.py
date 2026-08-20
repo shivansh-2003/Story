@@ -1,10 +1,12 @@
 import uuid
 
+from fastapi import BackgroundTasks
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.characters.models import Character, CharacterRelationship
 from app.characters.schemas import CharacterCreate, CharacterRelationshipCreate, CharacterUpdate
+from app.characters.summarizer import should_resummarize, summarize_character
 from app.core.deps import get_owned_character
 from app.core.logging_utils import log_execution
 from app.users.models import User
@@ -19,23 +21,29 @@ async def list_characters(db: AsyncSession, user: User) -> list[Character]:
 
 
 @log_execution
-async def create_character(db: AsyncSession, user: User, body: CharacterCreate) -> Character:
+async def create_character(
+    db: AsyncSession, user: User, body: CharacterCreate, background_tasks: BackgroundTasks
+) -> Character:
     character = Character(user_id=user.id, **body.model_dump())
     db.add(character)
     await db.commit()
     await db.refresh(character)
+    background_tasks.add_task(summarize_character, character.id)
     return character
 
 
 @log_execution
 async def update_character(
-    db: AsyncSession, user: User, character_id: uuid.UUID, body: CharacterUpdate
+    db: AsyncSession, user: User, character_id: uuid.UUID, body: CharacterUpdate, background_tasks: BackgroundTasks
 ) -> Character:
     character = await get_owned_character(db, character_id, user)
-    for field, value in body.model_dump(exclude_unset=True).items():
+    fields = body.model_dump(exclude_unset=True)
+    for field, value in fields.items():
         setattr(character, field, value)
     await db.commit()
     await db.refresh(character)
+    if should_resummarize(set(fields.keys())):
+        background_tasks.add_task(summarize_character, character.id)
     return character
 
 

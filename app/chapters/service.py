@@ -1,6 +1,6 @@
 import uuid
 
-from fastapi import HTTPException, status
+from fastapi import BackgroundTasks, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -8,6 +8,7 @@ from app.chapters.models import CHAPTER_TRANSITIONS, Chapter, ChapterCharacter, 
 from app.chapters.schemas import ChapterCreate, ChapterReorderRequest, ChapterUpdate
 from app.characters.models import Character
 from app.characters.schemas import CharacterCreate
+from app.characters.summarizer import summarize_character
 from app.core.deps import get_owned_chapter, get_owned_character, get_owned_story
 from app.core.logging_utils import log_execution
 from app.core.status import assert_transition
@@ -169,7 +170,12 @@ async def remove_active_character(
 
 @log_execution
 async def create_and_activate_character(
-    db: AsyncSession, user: User, story_id: uuid.UUID, chapter_id: uuid.UUID, body: CharacterCreate
+    db: AsyncSession,
+    user: User,
+    story_id: uuid.UUID,
+    chapter_id: uuid.UUID,
+    body: CharacterCreate,
+    background_tasks: BackgroundTasks,
 ) -> Character:
     """Create a character and mark it active in this chapter in one
     transaction — for "a new character just entered the scene," so the
@@ -183,6 +189,7 @@ async def create_and_activate_character(
     db.add(ChapterCharacter(chapter_id=chapter_id, character_id=character.id))
     await db.commit()
     await db.refresh(character)
+    background_tasks.add_task(summarize_character, character.id)
     return character
 
 

@@ -6,9 +6,10 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 from fastapi.responses import StreamingResponse
 
-from app.core.deps import CurrentUser, DbSession, get_owned_chapter
+from app.core.deps import CurrentUser, DbSession, RateLimitedUser, get_owned_chapter
 from app.generation import service, summarizer
 from app.generation.schemas import EditRequest, GenerateRequest, ManualEditRequest, TurnOut
+from app.generation.session_store import SessionConflict
 
 router = APIRouter(prefix="/stories/{story_id}/chapters/{chapter_id}", tags=["generation"])
 
@@ -36,7 +37,7 @@ async def generate(
     chapter_id: uuid.UUID,
     body: GenerateRequest,
     db: DbSession,
-    current_user: CurrentUser,
+    current_user: RateLimitedUser,
 ) -> StreamingResponse:
     chapter = await get_owned_chapter(db, story_id, chapter_id, current_user)
     system, user, state = await service.prepare_continue(db, chapter, story_id, body.instruction, body.length)
@@ -50,7 +51,7 @@ async def generate_edit(
     chapter_id: uuid.UUID,
     body: EditRequest,
     db: DbSession,
-    current_user: CurrentUser,
+    current_user: RateLimitedUser,
 ) -> StreamingResponse:
     """Regenerate against the current pending draft. Always acts on pending_turn
     as-is regardless of source (ai or user_edit) — this satisfies "don't
@@ -89,12 +90,23 @@ async def accept(
         return await service.accept_pending(db, chapter, background_tasks)
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+    except SessionConflict:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This chapter was updated in another tab or session — refresh and try again.",
+        )
 
 
 @router.post("/discard")
 async def discard(story_id: uuid.UUID, chapter_id: uuid.UUID, db: DbSession, current_user: CurrentUser) -> dict:
     chapter = await get_owned_chapter(db, story_id, chapter_id, current_user)
-    await service.discard_pending(db, chapter)
+    try:
+        await service.discard_pending(db, chapter)
+    except SessionConflict:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This chapter was updated in another tab or session — refresh and try again.",
+        )
     return {"discarded": True}
 
 

@@ -12,7 +12,7 @@ from app.chapters.service import set_chapter_status
 from app.core.llm_client import stream_model
 from app.core.logging_utils import log_execution
 from app.database import async_session
-from app.generation import assembler, session_store, summarizer
+from app.generation import assembler, embedder, session_store, summarizer
 from app.generation.models import ChapterTurn
 
 logger = logging.getLogger("story_assistant.generation")
@@ -156,6 +156,7 @@ async def accept_pending(db: AsyncSession, chapter: Chapter, background_tasks: B
     await set_chapter_status(db, chapter_id, ChapterStatus.in_progress, chapter=chapter)
 
     background_tasks.add_task(summarizer.maybe_compact_session, chapter_id)
+    background_tasks.add_task(embedder.embed_turn, turn.id)
     return {"accepted": True, "sequence": next_sequence}
 
 

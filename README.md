@@ -185,8 +185,9 @@ This is what the app actually gets you, day to day:
 | **Characters** | Full sheet (name, role, age, pronouns, appearance, voice notes, personality traits, motivation, flaw, backstory) plus directional relationships between characters. |
 | **Stories** | Story bible (title, genre, tone, POV, tense, rating, premise, opening line, setting, themes, content boundaries, writing style notes, target audience) plus which characters are imported into it. |
 | **Chapters** | Ordered within a story, own active-character subset, reorderable, archivable, lockable. |
-| **The writing loop** | Streamed generation, edit-in-place, regenerate (keeps discarded drafts as restorable "sibling attempts", up to 3), manual hand-editing, accept, discard. |
-| **Continuity** | Two background summarization triggers: one compacts a long chapter's older text as it's written; one summarizes a completed chapter for future chapters to reference. |
+| **The writing loop** | Streamed generation, edit-in-place, regenerate (keeps discarded drafts as restorable "sibling attempts", up to 3), manual hand-editing, accept, discard. `/generate` and `/generate/edit` are per-user token-bucket rate limited (burst 10, ~10/min sustained) — a 429 with `Retry-After` if exceeded. |
+| **Continuity** | Two background summarization triggers: one compacts a long chapter's older text as it's written; one summarizes a completed chapter for future chapters to reference. A character's `condensed_summary` is auto-generated in the background on create/update, feeding directly into every generation prompt. |
+| **Session integrity** | A chapter's Redis session state is optimistic-locked (Redis `WATCH`/`MULTI`/`EXEC` on a `version` field) — a concurrent write from another tab/request raises `SessionConflict`, surfaced as `409` on `/accept` and `/discard`. |
 | **Status lifecycle** | Stories: `draft → ongoing ⇄ on_hold → completed/abandoned` (reopenable). Chapters: `draft → in_progress → in_review → complete → locked` (reversible). |
 
 ---
@@ -535,10 +536,10 @@ flowchart TD
     Root --> Scripts["scripts/  — one-off DB migration scripts"]
     Root --> Tests["tests/  — smoke test"]
 
-    App --> Core["core/ — security, ownership checks,\nstatus state machine, LLM client"]
+    App --> Core["core/ — security, ownership checks,\nstatus state machine, LLM client,\nper-user rate limiting"]
     App --> Auth["auth/ — signup, login, /me"]
     App --> Users["users/ — User model only"]
-    App --> Characters["characters/ — character CRUD, relationships"]
+    App --> Characters["characters/ — character CRUD, relationships,\ncondensed_summary auto-generation"]
     App --> Stories["stories/ — story bible CRUD, cast import"]
     App --> Chapters["chapters/ — chapter CRUD, reorder,\nactive cast, lock/unlock"]
     App --> Generation["generation/ — the writing loop"]
@@ -561,16 +562,19 @@ Story/
 │   ├── database.py          async engine/session, Base, uuid_pk()
 │   ├── core/
 │   │   ├── security.py      password hashing, JWT
-│   │   ├── deps.py          get_db, get_current_user, ownership checks
+│   │   ├── deps.py          get_db, get_current_user, ownership checks,
+│   │   │                    rate_limited_user (RateLimitedUser)
 │   │   ├── status.py        shared status-transition guard
-│   │   └── llm_client.py    OpenAI / Ollama dispatch, retry, streaming
+│   │   ├── llm_client.py    OpenAI / Ollama dispatch, retry, streaming
+│   │   └── rate_limit.py    per-user token bucket, enforce_generation_rate_limit
 │   ├── auth/                router.py, schemas.py, service.py
 │   ├── users/                models.py only
-│   ├── characters/           models / schemas / service / router
+│   ├── characters/           models / schemas / service / router,
+│   │                         summarizer.py (condensed_summary background job)
 │   ├── stories/               models / schemas / service / router
 │   ├── chapters/               models / schemas / service / router
-│   └── generation/              models, schemas, session_store,
-│                                 assembler, summarizer, service, router
+│   └── generation/              models, schemas, session_store (optimistic
+│                                 locking), assembler, summarizer, service, router
 ├── frontend/
 │   └── src/
 │       ├── lib/               apiFetch.ts, auth.tsx, types.ts
@@ -596,27 +600,38 @@ Story/
 ```mermaid
 flowchart TD
     Sec["security.py\npassword hash, JWT encode/decode"]
-    Deps["deps.py\nCurrentUser, get_owned_*"]
+    Deps["deps.py\nCurrentUser, RateLimitedUser, get_owned_*"]
     Status["status.py\nassert_transition"]
     LLM["llm_client.py\ncall_model, stream_model"]
+    RateLimit["rate_limit.py\ntoken bucket per user"]
     Sec --> Deps
+    RateLimit --> Deps
     Every["every domain's router"] --> Deps
     StoriesChapters["stories/, chapters/ services"] --> Status
     Generation["generation/"] --> LLM
-    Summarizer["generation/summarizer.py"] --> LLM
+    Summarizer["generation/summarizer.py,\ncharacters/summarizer.py"] --> LLM
 ```
 
 - **`security.py`** — bcrypt password hashing, JWT create/decode.
 - **`deps.py`** — FastAPI dependencies: `CurrentUser` (decodes the bearer
-  token, loads the `User`), and `get_owned_story` / `get_owned_character` /
-  `get_owned_chapter` — the "does this belong to you?" check, 404 rather
-  than 403 so a non-owner can't even tell a resource exists.
+  token, loads the `User`), `RateLimitedUser` (wraps `CurrentUser` with
+  `rate_limit.enforce_generation_rate_limit` — a drop-in replacement used
+  only on `/generate` and `/generate/edit`), and `get_owned_story` /
+  `get_owned_character` / `get_owned_chapter` — the "does this belong to
+  you?" check, 404 rather than 403 so a non-owner can't even tell a
+  resource exists.
 - **`status.py`** — `assert_transition(current, new, allowed)`, the one
   function every status-changing write path calls.
 - **`llm_client.py`** — the only file that talks to an LLM. `call_model()`
   (one-shot, retried, used by background summarization) and
   `stream_model()` (word-by-word, used by live generation). Both dispatch
   to OpenAI or Ollama based on `settings.llm_provider`.
+- **`rate_limit.py`** — a per-user token bucket in Redis (burst 10 requests,
+  refilling at ~10/min sustained). `check_and_consume()` does the bucket
+  math; `enforce_generation_rate_limit()` is the dependency body that turns
+  an empty bucket into a `429` with `Retry-After`. Scoped by string (only
+  `"generate"` today) so other endpoints could get their own independent
+  budget later without new infrastructure.
 
 ### `app/auth/` — signup, login, "who am I"
 
@@ -650,14 +665,29 @@ flowchart TD
     Router["router.py"] --> Service["service.py"]
     Service --> Models["models.py\nCharacter, CharacterRelationship"]
     Service --> Schemas["schemas.py"]
-    Chapters["chapters/service.py"] -.list_active_characters.-> Models
+    Service -- "BackgroundTasks,\nif a summary-relevant field changed" --> Summarizer["summarizer.py\nsummarize_character()"]
+    Summarizer --> LLM["core/llm_client.py\ncall_model"]
+    Summarizer --> Models
+    Chapters["chapters/service.py\ncreate_and_activate_character"] -.also schedules.-> Summarizer
+    Chapters -.list_active_characters.-> Models
     Assembler["generation/assembler.py"] -.list_relationships_among.-> Service
+    Assembler -.reads condensed_summary.-> Models
 ```
 
 CRUD (`create` / `list` / `get` / `update` / `archive`) plus directional
-relationships between characters. `condensed_summary` is the short,
-prompt-ready version of a character sheet — currently set by hand, no
-auto-generator wired up yet.
+relationships between characters. `condensed_summary` — the short,
+prompt-ready version of a character sheet that `generation/assembler.py`
+puts into every system prompt — is generated automatically: `create_character`
+and `update_character` schedule `characters/summarizer.py`'s
+`summarize_character()` as a `BackgroundTasks` job (mirroring the
+`generation/summarizer.py` pattern — one `call_model` call, non-blocking).
+`update_character` only re-triggers it when a field that actually feeds the
+summary changed (`should_resummarize()` — appearance, voice notes,
+personality traits, motivation, flaw, backstory), so patching e.g. just
+`age` or `pronouns` doesn't cost a model call. `chapters/service.py`'s
+`create_and_activate_character` schedules the same job, since it builds a
+`Character` directly rather than going through this module's
+`create_character`.
 
 ### `app/stories/` — the story bible
 
@@ -711,11 +741,11 @@ flowchart TD
 |---|---|
 | `models.py` | The one durable table, `chapter_turns` — one row per accepted paragraph. |
 | `schemas.py` | Request/response shapes for the writing-loop endpoints. |
-| `session_store.py` | Redis scratch pad for a chapter's in-progress draft. |
+| `session_store.py` | Redis scratch pad for a chapter's in-progress draft. Writes are optimistic-locked (`WATCH`/`MULTI`/`EXEC` on a `version` field in the state blob) — a write against a stale version retries up to 5 times against a freshly-read state, then raises `SessionConflict` if the key is still genuinely contested. |
 | `assembler.py` | Builds the `(system, user)` prompt actually sent to the LLM, with priority-ordered budget trimming. |
 | `summarizer.py` | The two background summarization jobs. |
 | `service.py` | Orchestrates generate / edit / accept / discard / complete / status transitions. |
-| `router.py` | HTTP + SSE endpoints, nested under `/stories/{story_id}/chapters/{chapter_id}/...`. |
+| `router.py` | HTTP + SSE endpoints, nested under `/stories/{story_id}/chapters/{chapter_id}/...`. `/generate` and `/generate/edit` require `RateLimitedUser` instead of plain `CurrentUser`; `/accept` and `/discard` catch `SessionConflict` and turn it into a `409`. |
 
 ---
 

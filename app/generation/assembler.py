@@ -6,9 +6,11 @@ from app.characters.models import Character, CharacterRelationship
 from app.characters.service import list_relationships_among
 from app.core.logging_utils import log_execution
 from app.database import async_session
+from app.generation import semantic_search
 from app.stories.models import Story
 
 MAX_PROMPT_TOKENS = 6000  # applies to the user message only — see _assemble_continue_user
+MAX_RETRIEVED_TURNS_CHARS = 1500  # ceiling so one very long retrieved paragraph can't dominate
 
 
 @log_execution
@@ -35,6 +37,22 @@ async def _fetch_relationships(character_ids: list[uuid.UUID]) -> list[Character
         return await list_relationships_among(db, character_ids)
 
 
+@log_execution
+async def _fetch_relevant_turns(story_id: uuid.UUID, chapter_id: uuid.UUID, instruction: str) -> list[str]:
+    """Independent of the other three gathered fetches — only needs the
+    instruction text, already available as a function parameter. Returns []
+    on any embedding failure (rate limit, timeout) rather than raising —
+    retrieval is an enhancement, not a hard requirement for generation to
+    proceed."""
+    try:
+        query_vector = await semantic_search.embed_query(instruction)
+    except Exception:
+        return []
+    async with async_session() as db:
+        turns = await semantic_search.search_relevant_turns(db, story_id, chapter_id, query_vector)
+    return [t.content[:MAX_RETRIEVED_TURNS_CHARS] for t in turns]
+
+
 async def build_continue_prompt(
     chapter_id: uuid.UUID,
     story_id: uuid.UUID,
@@ -51,17 +69,19 @@ async def build_continue_prompt(
     prefix across a generate → regenerate → edit burst instead of re-sending
     and re-evaluating it fresh every call.
 
-    story, active characters, and prior-chapter summaries are three
-    independent reads with no data dependency between them, so they run
-    concurrently — each on its own short-lived session, since AsyncSession
-    isn't safe for interleaved use from multiple coroutines. relationships
+    story, active characters, prior-chapter summaries, and semantically
+    relevant past turns are four independent reads with no data dependency
+    between them, so they run concurrently — each on its own short-lived
+    session, since AsyncSession isn't safe for interleaved use from multiple
+    coroutines. relationships
     genuinely depends on the character IDs from the characters fetch (it's
     not independent — verified against the actual query before assuming
     otherwise), so it runs after, not folded into the same gather()."""
-    story, characters, prior_chapter_summaries = await asyncio.gather(
+    story, characters, prior_chapter_summaries, relevant_turns = await asyncio.gather(
         _fetch_story(story_id),
         _fetch_active_characters(chapter_id),
         _fetch_prior_summaries(story_id, chapter_id),
+        _fetch_relevant_turns(story_id, chapter_id, instruction),
     )
     relationships = await _fetch_relationships([c.id for c in characters])
 
@@ -70,6 +90,7 @@ async def build_continue_prompt(
         prior_summaries=prior_chapter_summaries,
         running_summary=session_state["running_summary"],
         raw_tail=session_state["raw_tail"][-2:],  # last 1-2 paragraphs, always verbatim
+        relevant_turns=relevant_turns,
         instruction=instruction,
         length_words=length_words,
     )
@@ -129,20 +150,25 @@ def _assemble_continue_user(
     prior_summaries: list[str],
     running_summary: str,
     raw_tail: list[str],
+    relevant_turns: list[str],
     instruction: str,
     length_words: int,
 ) -> str:
     """Priority-ordered budget enforcement, cheapest-to-lose first:
     1. oldest prior-chapter summaries, one at a time
-    2. the running summary, wholesale (it's already a 2-4 sentence rollup —
+    2. retrieved semantically-relevant turns, wholesale (already capped at
+       semantic_search.TOP_K — a bonus callback aid, not baseline continuity,
+       so it goes before the things that actually shape voice/continuity)
+    3. the running summary, wholesale (it's already a 2-4 sentence rollup —
        no finer-grained truncation is worth building for that little text)
-    3. the older of the two raw_tail paragraphs
+    4. the older of the two raw_tail paragraphs
     Never trimmed: the instruction and length directive — sent even if the
-    prompt is still over budget after exhausting 1-3, since a truncated
+    prompt is still over budget after exhausting 1-4, since a truncated
     instruction is worse than a long prompt."""
     summaries = list(prior_summaries)  # oldest first, per get_prior_chapter_summaries' ordering
     tail = list(raw_tail)
     summary = running_summary
+    retrieved = list(relevant_turns)
 
     protected = [
         f"Instruction: {instruction}",
@@ -153,6 +179,8 @@ def _assemble_continue_user(
         parts = []
         if summaries:
             parts.append(_format_prior_summaries(summaries))
+        if retrieved:
+            parts.append(_format_retrieved_context(retrieved))
         if summary:
             parts.append(f"Chapter so far (summary): {summary}")
         if tail:
@@ -163,6 +191,9 @@ def _assemble_continue_user(
     while _approx_tokens(prompt) > MAX_PROMPT_TOKENS and summaries:
         summaries.pop(0)
         prompt = render()
+    while _approx_tokens(prompt) > MAX_PROMPT_TOKENS and retrieved:
+        retrieved = []  # dropped as a whole block — already capped at TOP_K, no long tail to trim piecemeal
+        prompt = render()
     while _approx_tokens(prompt) > MAX_PROMPT_TOKENS and summary:
         summary = ""
         prompt = render()
@@ -170,6 +201,10 @@ def _assemble_continue_user(
         tail.pop(0)
         prompt = render()
     return prompt
+
+
+def _format_retrieved_context(turns: list[str]) -> str:
+    return "Relevant past scenes (may be from any earlier chapter):\n" + "\n\n---\n\n".join(turns)
 
 
 def _approx_tokens(text: str) -> float:
@@ -240,6 +275,7 @@ def _demo() -> None:
         prior_summaries=huge_summaries,
         running_summary="running summary text",
         raw_tail=["paragraph one", "paragraph two"],
+        relevant_turns=["a retrieved callback paragraph"],
         instruction="write the next scene",
         length_words=100,
     )
@@ -247,15 +283,30 @@ def _demo() -> None:
     assert "Write approximately 100 words" in prompt  # never trimmed
     assert "chapter 0 summary" not in prompt  # oldest dropped first
     assert "chapter 1999 summary" in prompt  # most recent summary kept longest
+    assert "a retrieved callback paragraph" in prompt  # kept when comfortably under budget
 
     small = _assemble_continue_user(
         prior_summaries=["a short summary"],
         running_summary="",
         raw_tail=[],
+        relevant_turns=[],
         instruction="continue",
         length_words=50,
     )
     assert "a short summary" in small  # nothing dropped when comfortably under budget
+    assert "Relevant past scenes" not in small  # section omitted when empty
+
+    tight_retrieval = _assemble_continue_user(
+        prior_summaries=[],
+        running_summary="keep this summary",
+        raw_tail=["keep this tail"],
+        relevant_turns=["filler word " * 6000],  # forces retrieval to be dropped before summary/tail
+        instruction="continue",
+        length_words=50,
+    )
+    assert "keep this summary" in tight_retrieval  # summary survives, dropped after retrieval
+    assert "keep this tail" in tight_retrieval  # tail survives too
+    assert "Relevant past scenes" not in tight_retrieval  # retrieval was the one dropped
 
     print("assembler self-check passed")
 

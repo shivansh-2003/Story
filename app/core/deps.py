@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.chapters.models import Chapter
 from app.characters.models import Character
+from app.core.rate_limit import enforce_generation_rate_limit
 from app.core.security import decode_access_token
 from app.database import get_db
 from app.stories.models import Story
@@ -34,6 +35,14 @@ async def get_current_user(
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+async def rate_limited_user(current_user: CurrentUser) -> User:
+    await enforce_generation_rate_limit(current_user.id)
+    return current_user
+
+
+RateLimitedUser = Annotated[User, Depends(rate_limited_user)]
 
 
 async def get_owned_story(db: AsyncSession, story_id: uuid.UUID, user: User) -> Story:

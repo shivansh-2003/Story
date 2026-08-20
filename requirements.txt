@@ -9,3 +9,4 @@ bcrypt
 redis>=5.0
 openai
 httpx
+pgvector
