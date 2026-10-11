@@ -3,9 +3,11 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from functools import lru_cache
+from typing import TypeVar
 
 import httpx
 from openai import AsyncOpenAI
+from pydantic import BaseModel
 
 from app.config import get_settings
 from app.core.logging_utils import log_execution
@@ -14,6 +16,21 @@ logger = logging.getLogger("story_assistant.llm")
 
 RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = (1, 2)  # sleep before attempt 2, before attempt 3
+JsonModel = TypeVar("JsonModel", bound=BaseModel)
+
+
+async def call_json_model(user: str, response_model: type[JsonModel], max_tokens: int, system: str) -> JsonModel:
+    """Validate a bounded JSON proposal using the existing provider abstraction."""
+    async with asyncio.timeout(150):
+        raw = await call_model(user, max_tokens=max_tokens, system=system)
+    if len(raw) > 60000:
+        raise ValueError("Model response exceeds the proposal limit")
+    raw = raw.strip()
+    if raw.startswith("```json\n") and raw.endswith("```"):
+        raw = raw[8:-3].strip()
+    elif raw.startswith("```\n") and raw.endswith("```"):
+        raw = raw[4:-3].strip()
+    return response_model.model_validate_json(raw)
 
 
 @lru_cache

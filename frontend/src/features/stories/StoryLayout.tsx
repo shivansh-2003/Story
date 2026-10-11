@@ -8,6 +8,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger } from "@/components/u
 import { StatusPill } from "@/components/StatusPill";
 import type { StoryDetail, StoryStatus } from "@/lib/types";
 import { getStory, updateStory } from "./storiesApi";
+import { ImportManuscriptDialog } from "@/features/transfers/ImportManuscriptDialog";
+import { ExportManuscriptDialog } from "@/features/transfers/ExportManuscriptDialog";
 
 // Mirrors app/stories/models.py's STORY_TRANSITIONS — the backend 409s on
 // any jump not listed here (e.g. draft -> completed), so the dropdown must
@@ -76,11 +78,16 @@ export function StoryLayout() {
         </Select>
       </div>
       {meta && <p className="mt-1 text-sm text-muted-foreground">{meta}</p>}
+      <div className="mt-4 flex flex-wrap gap-2">
+        <ImportManuscriptDialog key={storyId} storyId={storyId} />
+        <ExportManuscriptDialog key={`export-${storyId}`} storyId={storyId} title={story.title} />
+      </div>
 
       <nav className="mt-4 flex gap-6 border-b border-border">
         <NavLink to="chapters" className={tabClass}>
           Chapters
         </NavLink>
+        <NavLink to="planning" className={tabClass}>Planning</NavLink>
         <NavLink to="cast" className={tabClass}>
           Cast · {story.characters.length}
         </NavLink>

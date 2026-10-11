@@ -27,6 +27,7 @@ type FetchOptions = {
   query?: Record<string, string>;
   skipAuth?: boolean;
   signal?: AbortSignal;
+  responseType?: "json" | "blob";
 };
 
 export async function apiFetch<T>(path: string, options: FetchOptions = {}): Promise<T> {
@@ -36,14 +37,15 @@ export async function apiFetch<T>(path: string, options: FetchOptions = {}): Pro
   }
 
   const headers: Record<string, string> = {};
-  if (options.body !== undefined) headers["Content-Type"] = "application/json";
+  const isForm = options.body instanceof FormData;
+  if (options.body !== undefined && !isForm) headers["Content-Type"] = "application/json";
   const token = getToken();
   if (token && !options.skipAuth) headers["Authorization"] = `Bearer ${token}`;
 
   const response = await fetch(url, {
     method: options.method ?? "GET",
     headers,
-    body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+    body: isForm ? options.body as FormData : options.body !== undefined ? JSON.stringify(options.body) : undefined,
     signal: options.signal,
   });
 
@@ -60,6 +62,7 @@ export async function apiFetch<T>(path: string, options: FetchOptions = {}): Pro
   }
 
   if (response.status === 204) return undefined as T;
+  if (options.responseType === "blob") return (await response.blob()) as T;
   return (await response.json()) as T;
 }
 

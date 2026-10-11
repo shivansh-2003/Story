@@ -4,7 +4,11 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 
 type Length = "short" | "standard" | "long";
 
-const LENGTH_HINT: Record<Length, string> = { short: "~50 words", standard: "~100 words", long: "~150 words" };
+const LENGTH_HINT: Record<Length, string> = {
+  short: "~50 words",
+  standard: "~100 words",
+  long: "~150 words",
+};
 
 export function InstructionConsole({
   instruction,
@@ -13,6 +17,7 @@ export function InstructionConsole({
   onLengthChange,
   generating,
   locked,
+  disabled = false,
   onUnlock,
   onSubmit,
   onStop,
@@ -23,6 +28,7 @@ export function InstructionConsole({
   onLengthChange: (length: Length) => void;
   generating: boolean;
   locked: boolean;
+  disabled?: boolean;
   onUnlock: () => void;
   onSubmit: () => void;
   onStop: () => void;
@@ -52,25 +58,39 @@ export function InstructionConsole({
         }}
         placeholder="What happens next?"
         rows={3}
-        disabled={generating}
+        disabled={generating || disabled}
         className="border-none bg-transparent p-0 font-manuscript text-base shadow-none focus-visible:ring-0"
       />
       <div className="mt-3 flex items-center justify-between">
-        <ToggleGroup type="single" value={length} onValueChange={(v) => v && onLengthChange(v as Length)}>
+        <ToggleGroup
+          type="single"
+          value={length}
+          onValueChange={(v) => v && onLengthChange(v as Length)}
+        >
           {(["short", "standard", "long"] as const).map((l) => (
-            <ToggleGroupItem key={l} value={l} className="font-mono text-xs uppercase tracking-wide" title={LENGTH_HINT[l]}>
+            <ToggleGroupItem
+              key={l}
+              value={l}
+              className="font-mono text-xs uppercase tracking-wide"
+              title={LENGTH_HINT[l]}
+            >
               {l}
             </ToggleGroupItem>
           ))}
         </ToggleGroup>
         <div className="flex items-center gap-2">
-          <span className="hidden font-mono text-xs text-muted-foreground sm:inline">⌘⏎</span>
+          <span className="hidden font-mono text-xs text-muted-foreground sm:inline">
+            ⌘⏎
+          </span>
           {generating ? (
             <Button variant="outline" onClick={onStop}>
               Stop
             </Button>
           ) : (
-            <Button onClick={onSubmit} disabled={!instruction.trim()}>
+            <Button
+              onClick={onSubmit}
+              disabled={disabled || !instruction.trim()}
+            >
               Write the next part
             </Button>
           )}

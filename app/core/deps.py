@@ -1,9 +1,12 @@
+import asyncio
+import logging
 import uuid
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.chapters.models import Chapter
@@ -15,6 +18,8 @@ from app.stories.models import Story
 from app.users.models import User
 
 bearer_scheme = HTTPBearer()
+logger = logging.getLogger(__name__)
+AUTH_DB_ATTEMPTS = 3
 
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 
@@ -27,7 +32,28 @@ async def get_current_user(
     if user_id is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
 
-    user = await db.get(User, user_id)
+    # Authentication is a read-only first operation in this request's session.
+    # A disconnect after pool_pre_ping can still fail this lookup; invalidate
+    # the failed connection before retrying. Never replay endpoint writes.
+    for attempt in range(AUTH_DB_ATTEMPTS):
+        try:
+            user = await db.get(User, user_id)
+            break
+        except (DBAPIError, TimeoutError, OSError) as error:
+            if isinstance(error, DBAPIError) and not error.connection_invalidated:
+                raise
+            await db.invalidate()
+            logger.warning(
+                "Authentication database connection failed (attempt %d/%d, %s)",
+                attempt + 1, AUTH_DB_ATTEMPTS, type(error).__name__,
+            )
+            if attempt == AUTH_DB_ATTEMPTS - 1:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Database temporarily unavailable. Please try again.",
+                    headers={"Retry-After": "3"},
+                ) from error
+            await asyncio.sleep(attempt + 1)
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
 
@@ -45,8 +71,12 @@ async def rate_limited_user(current_user: CurrentUser) -> User:
 RateLimitedUser = Annotated[User, Depends(rate_limited_user)]
 
 
-async def get_owned_story(db: AsyncSession, story_id: uuid.UUID, user: User) -> Story:
-    story = await db.get(Story, story_id)
+async def get_owned_story(db: AsyncSession, story_id: uuid.UUID, user: User, *, for_update: bool = False) -> Story:
+    if for_update:
+        story = await db.scalar(select(Story).where(Story.id == story_id).with_for_update()
+                                .execution_options(populate_existing=True))
+    else:
+        story = await db.get(Story, story_id)
     if story is None or story.is_archived or story.user_id != user.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Story not found")
     return story

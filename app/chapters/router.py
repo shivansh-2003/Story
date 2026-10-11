@@ -8,6 +8,8 @@ from app.chapters.schemas import ChapterCreate, ChapterDetailRead, ChapterRead, 
 from app.characters.models import Character
 from app.characters.schemas import CharacterCreate, CharacterRead
 from app.core.deps import CurrentUser, DbSession, get_owned_chapter
+from app.manuscript.service import list_turns
+from app.manuscript.schemas import TurnRead
 
 router = APIRouter(prefix="/stories/{story_id}/chapters", tags=["chapters"])
 
@@ -36,9 +38,10 @@ async def get_chapter(
     story_id: uuid.UUID, chapter_id: uuid.UUID, db: DbSession, current_user: CurrentUser
 ) -> ChapterDetailRead:
     chapter = await get_owned_chapter(db, story_id, chapter_id, current_user)
-    body_text = await service.get_chapter_body(db, chapter_id)
+    turns = [TurnRead.model_validate(t) for t in await list_turns(db, chapter_id)]
+    body_text = "\n\n".join(turn.content for turn in turns)
     return ChapterDetailRead.model_validate(chapter, from_attributes=True).model_copy(
-        update={"body": body_text}
+        update={"body": body_text, "turns": turns}
     )
 
 

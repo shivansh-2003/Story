@@ -1,6 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,7 +26,12 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_model: str = "gpt-4o-mini"
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "qwen3.6:latest"
+    ollama_model: str = "qwen3.8:27b-mlx"
+
+    import_max_bytes: int = Field(default=2_000_000, ge=1, le=10_000_000)
+    import_max_chapters: int = Field(default=100, ge=1, le=100)
+    import_max_paragraphs: int = Field(default=2000, ge=1, le=2000)
+    import_preview_ttl_minutes: int = Field(default=30, ge=1, le=1440)
 
 
 @lru_cache

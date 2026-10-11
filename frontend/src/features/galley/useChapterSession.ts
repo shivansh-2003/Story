@@ -1,51 +1,105 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useStreamBuffer } from "@/hooks/useStreamBuffer";
-import type { ChapterDetail, Turn, UUID } from "@/lib/types";
+import type {
+  AcceptedTurn,
+  ChapterDetail,
+  ChapterSession,
+  Turn,
+  UUID,
+} from "@/lib/types";
 import * as api from "./generationApi";
 
-type Status = "idle" | "generating" | "accepting" | "completing" | "error";
+type Status =
+  "idle" | "generating" | "accepting" | "completing" | "saving" | "error";
 type Length = "short" | "standard" | "long";
-
-type ChapterSessionState = {
-  acceptedParagraphs: string[]; // mirrors ChapterTurn rows, seeded on load
-  pendingTurn: Turn | null; // mirrors Redis pending_turn
-  siblingAttempts: Turn[]; // mirrors Redis sibling_attempts, display-only
+type State = {
+  acceptedParagraphs: AcceptedTurn[];
+  pendingTurn: Turn | null;
+  siblingAttempts: Turn[];
+  sessionVersion: number;
+  staleDraft: boolean;
+  ready: boolean;
   status: Status;
   errorMessage: string | null;
 };
-
-const initialState: ChapterSessionState = {
+const initialState: State = {
   acceptedParagraphs: [],
   pendingTurn: null,
   siblingAttempts: [],
+  sessionVersion: 0,
+  staleDraft: false,
+  ready: false,
   status: "idle",
   errorMessage: null,
 };
 
 export function useChapterSession(storyId: UUID, chapterId: UUID) {
-  const [state, setState] = useState<ChapterSessionState>(initialState);
+  const [state, setState] = useState<State>(initialState);
   const stream = useStreamBuffer();
   const abortRef = useRef<AbortController | null>(null);
+  const applySession = useCallback((session: ChapterSession) => {
+    setState((s) => ({
+      ...s,
+      pendingTurn: session.pending_turn,
+      siblingAttempts: session.sibling_attempts,
+      sessionVersion: session.version,
+      staleDraft: session.stale_draft,
+      ready: true,
+    }));
+  }, []);
+  const reloadSession = useCallback(
+    async () => applySession(await api.getSession(storyId, chapterId)),
+    [storyId, chapterId, applySession],
+  );
 
-  // rAF-batched: stream.text only changes once per frame no matter how many
-  // deltas arrived in between, so this setState runs at frame rate, not
-  // token rate.
+  useEffect(() => {
+    const controller = new AbortController();
+    setState(initialState);
+    api
+      .getSession(storyId, chapterId, controller.signal)
+      .then(applySession)
+      .catch((e: Error) => {
+        if (e.name !== "AbortError")
+          setState((s) => ({ ...s, status: "error", errorMessage: e.message }));
+      });
+    return () => {
+      controller.abort();
+      abortRef.current?.abort();
+    };
+  }, [storyId, chapterId, applySession]);
+
   useEffect(() => {
     if (state.status !== "generating") return;
-    setState((s) => (s.pendingTurn ? { ...s, pendingTurn: { ...s.pendingTurn, content: stream.text } } : s));
+    setState((s) =>
+      s.pendingTurn
+        ? { ...s, pendingTurn: { ...s.pendingTurn, content: stream.text } }
+        : s,
+    );
   }, [stream.text, state.status]);
 
-  // Seeded from GalleyPage's own react-query fetch — this hook used to fetch
-  // getChapter() a second time itself, doubling the request (and the three
-  // sequential DB round trips behind it) on every chapter open.
   const hydrate = useCallback((data: ChapterDetail) => {
-    setState((s) => ({ ...s, acceptedParagraphs: data.body ? data.body.split("\n\n") : [] }));
-    // pendingTurn intentionally NOT restored from a full page reload — there's
-    // no GET .../session endpoint exposing Redis state. Known gap, see GalleyPage.
+    setState((s) => ({ ...s, acceptedParagraphs: data.turns }));
   }, []);
+  const updateAccepted = useCallback(
+    (turn: AcceptedTurn) => {
+      setState((s) => ({
+        ...s,
+        acceptedParagraphs: s.acceptedParagraphs.map((t) =>
+          t.id === turn.id ? turn : t,
+        ),
+      }));
+      void reloadSession().catch((e: Error) =>
+        setState((s) => ({ ...s, errorMessage: e.message })),
+      );
+    },
+    [reloadSession],
+  );
 
   const runStream = useCallback(
-    async (instruction: string, streamFn: (signal: AbortSignal) => Promise<void>) => {
+    async (
+      instruction: string,
+      streamFn: (signal: AbortSignal) => Promise<void>,
+    ) => {
       stream.reset();
       const controller = new AbortController();
       abortRef.current = controller;
@@ -53,98 +107,171 @@ export function useChapterSession(storyId: UUID, chapterId: UUID) {
         ...s,
         status: "generating",
         errorMessage: null,
-        siblingAttempts: s.pendingTurn ? [s.pendingTurn, ...s.siblingAttempts].slice(0, 3) : s.siblingAttempts,
         pendingTurn: { content: "", instruction, source: "ai" },
       }));
       try {
         await streamFn(controller.signal);
-        // peek(), not .text — the last delta may not have hit a rAF flush yet.
-        setState((s) => (s.pendingTurn ? { ...s, status: "idle", pendingTurn: { ...s.pendingTurn, content: stream.peek() } } : { ...s, status: "idle" }));
+        await reloadSession();
+        setState((s) => ({ ...s, status: "idle" }));
       } catch (e) {
-        if ((e as Error).name === "AbortError") {
-          setState((s) => ({ ...s, status: "idle" }));
-        } else {
-          setState((s) => ({ ...s, status: "error", errorMessage: (e as Error).message, pendingTurn: null }));
-        }
+        // Recover the server's last saved draft, including after cancellation.
+        if (!controller.signal.aborted) await reloadSession().catch(() => {});
+        setState((s) => ({
+          ...s,
+          ready:
+            (e as Error).name !== "AbortError" && !!s.pendingTurn?.draft_id,
+          status: "error",
+          errorMessage:
+            (e as Error).name === "AbortError"
+              ? "Generation stopped. Reload the draft before continuing."
+              : (e as Error).message,
+        }));
       } finally {
         abortRef.current = null;
       }
     },
-    [stream],
+    [stream, reloadSession],
   );
 
   const doGenerate = useCallback(
-    (instruction: string, length: Length) =>
-      runStream(instruction, (signal) => api.generate(storyId, chapterId, instruction, length, stream.append, signal)),
+    (instruction: string, length: Length, sceneId?: UUID | null) =>
+      runStream(instruction, (signal) =>
+        api.generate(
+          storyId,
+          chapterId,
+          instruction,
+          length,
+          stream.append,
+          signal,
+          sceneId,
+        ),
+      ),
     [storyId, chapterId, runStream, stream.append],
   );
-
   const doEditInstruction = useCallback(
     (instruction: string) =>
-      runStream(instruction, (signal) => api.generateEdit(storyId, chapterId, instruction, stream.append, signal)),
+      runStream(instruction, (signal) =>
+        api.generateEdit(
+          storyId,
+          chapterId,
+          instruction,
+          stream.append,
+          signal,
+        ),
+      ),
     [storyId, chapterId, runStream, stream.append],
   );
-
-  const stopGenerating = useCallback(() => {
-    abortRef.current?.abort();
-  }, []);
-
-  // Local-first for responsiveness; server write is debounced (useDebouncedManualEdit)
-  const doManualEdit = useCallback((content: string) => {
-    setState((s) => ({ ...s, pendingTurn: { content, instruction: null, source: "user_edit" } }));
-  }, []);
+  const stopGenerating = useCallback(() => abortRef.current?.abort(), []);
+  const saveManualEdit = useCallback(
+    async (content: string) => {
+      setState((s) => ({ ...s, status: "saving", errorMessage: null }));
+      try {
+        await api.manualEdit(storyId, chapterId, content, state.sessionVersion);
+        await reloadSession();
+        setState((s) => ({ ...s, status: "idle" }));
+        return true;
+      } catch (e) {
+        setState((s) => ({
+          ...s,
+          status: "error",
+          errorMessage: (e as Error).message,
+        }));
+        return false;
+      }
+    },
+    [storyId, chapterId, state.sessionVersion, reloadSession],
+  );
 
   const doAccept = useCallback(async () => {
-    if (!state.pendingTurn) return;
-    setState((s) => ({ ...s, status: "accepting" }));
-    const accepted = state.pendingTurn.content;
+    if (!state.pendingTurn?.draft_id) return false;
+    setState((s) => ({ ...s, status: "accepting", errorMessage: null }));
     try {
-      await api.accept(storyId, chapterId);
+      const { turn } = await api.accept(
+        storyId,
+        chapterId,
+        state.pendingTurn.draft_id,
+      );
       setState((s) => ({
         ...s,
         status: "idle",
-        acceptedParagraphs: [...s.acceptedParagraphs, accepted],
+        acceptedParagraphs: s.acceptedParagraphs.some((t) => t.id === turn.id)
+          ? s.acceptedParagraphs
+          : [...s.acceptedParagraphs, turn],
         pendingTurn: null,
         siblingAttempts: [],
+        staleDraft: false,
       }));
+      await reloadSession();
+      return true;
     } catch (e) {
-      setState((s) => ({ ...s, status: "error", errorMessage: (e as Error).message }));
+      setState((s) => ({
+        ...s,
+        status: "error",
+        errorMessage: (e as Error).message,
+      }));
+      return false;
     }
-  }, [storyId, chapterId, state.pendingTurn]);
-
+  }, [storyId, chapterId, state.pendingTurn, reloadSession]);
   const doDiscard = useCallback(async () => {
-    await api.discard(storyId, chapterId);
-    setState((s) => ({ ...s, pendingTurn: null, siblingAttempts: [] }));
-  }, [storyId, chapterId]);
-
-  const restoreSibling = useCallback((turn: Turn) => {
-    // local-only swap — no server call needed just to preview a sibling.
-    // If the user then accepts, that accept call is what makes it durable.
-    setState((s) => ({ ...s, pendingTurn: turn, siblingAttempts: s.siblingAttempts.filter((t) => t !== turn) }));
-  }, []);
-
-  const doComplete = useCallback(async () => {
-    if (state.pendingTurn) {
-      setState((s) => ({ ...s, errorMessage: "Resolve the draft on the page first — keep it or throw it away." }));
-      return false; // mirrors the backend's explicit block
+    try {
+      await api.discard(storyId, chapterId);
+      await reloadSession();
+      setState((s) => ({ ...s, status: "idle", errorMessage: null }));
+    } catch (e) {
+      setState((s) => ({
+        ...s,
+        status: "error",
+        errorMessage: (e as Error).message,
+      }));
     }
+  }, [storyId, chapterId, reloadSession]);
+  const restoreSibling = useCallback(
+    async (turn: Turn) => {
+      if (!turn.draft_id) return;
+      setState((s) => ({ ...s, status: "saving" }));
+      try {
+        await api.selectAttempt(
+          storyId,
+          chapterId,
+          turn.draft_id,
+          state.sessionVersion,
+        );
+        await reloadSession();
+        setState((s) => ({ ...s, status: "idle", errorMessage: null }));
+      } catch (e) {
+        setState((s) => ({
+          ...s,
+          status: "error",
+          errorMessage: (e as Error).message,
+        }));
+      }
+    },
+    [storyId, chapterId, state.sessionVersion, reloadSession],
+  );
+  const doComplete = useCallback(async () => {
+    if (state.pendingTurn) return false;
     setState((s) => ({ ...s, status: "completing" }));
     try {
       await api.completeChapter(storyId, chapterId);
       setState((s) => ({ ...s, status: "idle" }));
       return true;
     } catch (e) {
-      setState((s) => ({ ...s, status: "error", errorMessage: (e as Error).message }));
+      setState((s) => ({
+        ...s,
+        status: "error",
+        errorMessage: (e as Error).message,
+      }));
       return false;
     }
   }, [storyId, chapterId, state.pendingTurn]);
-
   return {
     state,
     hydrate,
+    updateAccepted,
+    reloadSession,
     doGenerate,
     doEditInstruction,
-    doManualEdit,
+    saveManualEdit,
     doAccept,
     doDiscard,
     restoreSibling,

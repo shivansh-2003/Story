@@ -1,5 +1,12 @@
 # Story Assistant
 
+> **Phase 1 update (10 October 2026):** Accepted paragraphs now support editing,
+> immutable revision history, and restoration. Memory refresh jobs use content
+> versions so old summaries and embeddings cannot overwrite new prose.
+> See [phase/phase1.md](phase/phase1.md) for implementation and rollout details.
+> Database startup now requires Alembic migrations; the older architecture
+> descriptions below should be read alongside that report.
+
 A full-stack app for co-writing fiction with an AI, one paragraph at a time.
 You create characters and a story, break the story into chapters, and then —
 chapter by chapter — ask the AI to write the next bit, read what it wrote,
@@ -820,14 +827,17 @@ flowchart LR
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 cp .env.example .env   # then fill in the values below
+.venv/bin/alembic upgrade head  # new empty database; existing DB: see phase/phase1.md
 .venv/bin/uvicorn app.main:app --reload
 ```
 
 Check it's up: `curl http://localhost:8000/health` → `{"status":"ok"}`.
 Interactive API docs at `http://localhost:8000/docs`.
 
-On a **brand-new** database, tables are created automatically on startup —
-no separate migration step needed. `scripts/migrate_optimizations.py` (run
+On a **brand-new** database, run `.venv/bin/alembic upgrade head` before
+starting the backend. For an existing database, follow the validated,
+backed-up migration workflow in [phase/phase1.md](phase/phase1.md). Startup
+checks the migration revision and does not change the schema. `scripts/migrate_optimizations.py` (run
 via `PYTHONPATH=. .venv/bin/python scripts/migrate_optimizations.py`) is
 only needed if you're pointing at a database that predates certain schema
 changes (new indexes, new status enum values) — safe to run regardless,
@@ -980,3 +990,46 @@ waking from auto-suspend (1.5–3s per request after an idle gap) — confirmed
 by the diagnostic above, and not fixable in application code. See the full
 report for the reasoning and the two remaining options (a keep-alive ping,
 or a Neon plan/tier change).
+
+## Phase 2 — Manuscript import and export
+
+Open a story and use **Import manuscript** to preview a UTF-8 `.txt` or `.md` file. Rename, exclude, or reorder detected chapters, then import them as new chapters. Existing writing stays in place. Blank lines separate paragraphs; text chapter headings use `Chapter 1: Title`, and Markdown chapter headings use `## Title`. Optional AI memory refresh is off by default; importing itself requires no AI credentials.
+
+Use **Export manuscript** to download current accepted writing as text or Markdown. Pending drafts are excluded; archived chapters are optional. Defaults limit imports to 2,000,000 bytes, 100 chapters, and 2,000 paragraphs; previews expire after 30 minutes. Configure limits with `IMPORT_MAX_BYTES`, `IMPORT_MAX_CHAPTERS`, `IMPORT_MAX_PARAGRAPHS`, and `IMPORT_PREVIEW_TTL_MINUTES`.
+
+Install updated dependencies and apply the additive migration to an existing Phase 1 database before restarting:
+
+```bash
+venv/bin/python -m pip install -r requirements.txt
+PYTHONPATH=. venv/bin/python scripts/migrate_phase2.py
+```
+
+The migration saves a private data snapshot and verifies every existing application table is unchanged. Use `venv/bin/alembic upgrade head` for a fresh database. See [phase/phase2.md](phase/phase2.md) for file changes, APIs, retry behavior, parsing rules, verification, and limits. DOCX support is deferred.
+
+## Phase 3 — Optional chapter and scene planning
+
+Use a story's **Planning** tab to save chapter objectives, conflict, ending beats, and notes, or add ordered scenes with goals, intended outcomes, setting, cast, and POV. Planning is optional: the Galley works without a plan or scene. Cast members must be active characters imported into the story.
+
+In the Galley, choose **Scene for next generation (optional)** to guide the next paragraph with that scene's plan and cast. Pending drafts keep their original scene; accepted paragraphs retain the association and display its name. With no scene selected, generation uses the existing chapter context and cast. Plans describe intended events; accepted prose and summaries describe actual events.
+
+**Suggest a plan** returns an editable proposal using your configured OpenAI/Ollama model. Suggestions do not save automatically. Review/edit it and choose **Save suggested plan and scenes** to save the approved chapter plan and append scenes. Manual planning needs no AI credentials; suggestions need the configured generation provider, but no embeddings.
+
+For an existing Phase 2 database, apply the migration before restarting:
+
+```bash
+PYTHONPATH=. venv/bin/python scripts/migrate_phase3.py
+```
+
+The script takes a private data snapshot and checks every existing row is preserved before committing. Fresh databases use `venv/bin/alembic upgrade head`. See [phase/phase3.md](phase/phase3.md) for the file map, API contracts, verification, conflict handling, and limits.
+
+### Phase 4: targeted AI rewriting
+
+In the Galley, choose **AI rewrite** beneath an accepted paragraph. Use the whole paragraph or highlight text and choose **Use selected text**, enter an instruction, and generate a suggestion. Compare the original and suggested text before choosing **Apply suggestion** or **Cancel suggestion**. Closing the dialog keeps the saved suggestion available for 30 minutes, including after reload.
+
+Applying replaces only the selected range and records an **AI rewrite** in paragraph history. Changed paragraphs, neighboring manuscript, or rewrite context require regeneration; repeated Apply cannot duplicate an edit. Planning is optional, and ordinary manual editing continues to work without AI.
+
+For an existing Phase 3 database, run `PYTHONPATH=. venv/bin/python scripts/migrate_phase4.py` before starting the backend. The script takes a private table-data snapshot and verifies all existing rows remain unchanged. Current migration head: `0005_phase4`.
+
+Verification commands: `STORY_TEST_POSTGRES=0 venv/bin/pytest -q` from the repository root, and `npm run build`, `npm run lint`, and `npm run test:rewriting` from `frontend/`. PostgreSQL tests require an explicitly separate `STORY_TEST_DATABASE_URL`; never point them at the application database.
+
+See [phase/phase4.md](phase/phase4.md) for limits, files, API behavior, and rollout verification.

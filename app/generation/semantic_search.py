@@ -40,6 +40,8 @@ async def search_relevant_turns(
             Chapter.story_id == story_id,
             ChapterTurn.chapter_id != current_chapter_id,
             ChapterTurn.embedding.is_not(None),
+            ChapterTurn.embedding_version == ChapterTurn.version,
+            Chapter.is_archived.is_(False),
         )
         .order_by(distance)
         .limit(TOP_K)

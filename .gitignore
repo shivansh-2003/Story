@@ -6,7 +6,6 @@ venv/
 .env.dev
 .env.prod
 *.db
-tests/
 .claude/
 .DS_Store
 README.html

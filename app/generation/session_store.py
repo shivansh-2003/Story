@@ -1,4 +1,5 @@
 import json
+import copy
 import uuid
 from functools import lru_cache
 
@@ -60,7 +61,7 @@ async def get_session(chapter_id: uuid.UUID) -> dict:
     # hit/miss pattern is consistent with wherever real caching lands later.
     log_cache_event(key, hit=raw is not None, source=f"{__name__}.get_session")
     if raw is None:
-        return dict(DEFAULT_STATE)
+        return copy.deepcopy(DEFAULT_STATE)
     return json.loads(raw)
 
 
@@ -82,7 +83,7 @@ async def save_session(chapter_id: uuid.UUID, state: dict) -> None:
             try:
                 await pipe.watch(key)
                 raw = await pipe.get(key)
-                current = json.loads(raw) if raw is not None else dict(DEFAULT_STATE)
+                current = json.loads(raw) if raw is not None else copy.deepcopy(DEFAULT_STATE)
 
                 if current["version"] != expected_version:
                     await pipe.unwatch()

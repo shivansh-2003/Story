@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FocusEvent, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { animate } from "animejs";
 import { useAnimeScope } from "@/hooks/useAnimeScope";
 import { prefersReducedMotion } from "@/lib/motion";
@@ -21,7 +21,7 @@ export function PendingDraft({
   content,
   streaming,
   editing,
-  onManualEdit,
+  busy,
   onEditSave,
   onEditCancel,
 }: {
@@ -29,14 +29,20 @@ export function PendingDraft({
   content: string;
   streaming: boolean;
   editing: boolean;
-  onManualEdit: (content: string) => void;
+  busy: boolean;
   onEditSave: (content: string) => void;
   onEditCancel: () => void;
 }) {
-  const editableRef = useRef<HTMLParagraphElement>(null);
+  const editableRef = useRef<HTMLTextAreaElement>(null);
+  const [draft, setDraft] = useState(content);
   const caretScope = useAnimeScope(() => {
     if (prefersReducedMotion()) return;
-    animate("[data-caret]", { opacity: [1, 0.2], duration: 900, alternate: true, loop: true });
+    animate("[data-caret]", {
+      opacity: [1, 0.2],
+      duration: 900,
+      alternate: true,
+      loop: true,
+    });
   }, [streaming]);
 
   // Screen-reader announcements: throttled to sentence boundaries while
@@ -59,55 +65,84 @@ export function PendingDraft({
   }, [content, streaming]);
 
   useEffect(() => {
-    if (editing && editableRef.current) {
-      editableRef.current.focus();
-      const range = document.createRange();
-      range.selectNodeContents(editableRef.current);
-      range.collapse(false);
-      const sel = window.getSelection();
-      sel?.removeAllRanges();
-      sel?.addRange(range);
+    if (editing) {
+      setDraft(content);
+      editableRef.current?.focus();
     }
-  }, [editing]);
+  }, [editing, content]);
 
-  function handleBlur(e: FocusEvent<HTMLParagraphElement>) {
-    if (!editing) return;
-    onEditSave(e.currentTarget.textContent ?? "");
-  }
-
-  function handleKeyDown(e: KeyboardEvent<HTMLParagraphElement>) {
-    if (!editing) return;
+  function handleKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Escape") {
       e.preventDefault();
-      onEditCancel();
+      e.stopPropagation();
+      if (!busy) onEditCancel();
     } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      e.currentTarget.blur();
+      e.stopPropagation();
+      if (!busy && draft.trim()) onEditSave(draft);
     }
   }
 
   return (
-    <div ref={caretScope} className={styles.pendingWash} role="group" aria-label="draft, not yet kept">
+    <div
+      ref={caretScope}
+      className={styles.pendingWash}
+      role="group"
+      aria-label="draft, not yet kept"
+    >
       <span className="sr-only" aria-live="polite" aria-atomic="true">
         {srMessage}
       </span>
-      <p
-        ref={editableRef}
-        className={styles.paragraph}
-        data-state="pending"
-        style={editing ? { color: "rgb(var(--sheet-foreground))", fontStyle: "normal" } : undefined}
-        contentEditable={editing}
-        suppressContentEditableWarning
-        onBlur={handleBlur}
-        onKeyDown={handleKeyDown}
-        onInput={(e) => editing && onManualEdit(e.currentTarget.textContent ?? "")}
-      >
-        <span className={`${styles.gutterMark} ${styles.pendingMark}`} aria-hidden="true">
-          ◆
-        </span>
-        {editing ? content : content || " "}
-        {streaming && !editing && <span className={styles.caret} data-caret />}
-      </p>
+      {editing ? (
+        <div>
+          <label
+            htmlFor="pending-paragraph"
+            className="text-sm"
+            style={{ color: "rgb(var(--sheet-foreground))" }}
+          >
+            Edit pending paragraph
+          </label>
+          <textarea
+            id="pending-paragraph"
+            ref={editableRef}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={handleKeyDown}
+            disabled={busy}
+            maxLength={50000}
+            className="mt-2 min-h-40 w-full rounded border p-3 font-manuscript text-lg"
+            style={{
+              color: "rgb(var(--sheet-foreground))",
+              background: "rgb(var(--sheet))",
+            }}
+          />
+          <div
+            className="mt-2 flex gap-4 text-sm"
+            style={{ color: "rgb(var(--pending))" }}
+          >
+            <button
+              disabled={busy || !draft.trim()}
+              onClick={() => onEditSave(draft)}
+            >
+              {busy ? "Saving…" : "Save draft"}
+            </button>
+            <button disabled={busy} onClick={onEditCancel}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <p className={styles.paragraph} data-state="pending">
+          <span
+            className={`${styles.gutterMark} ${styles.pendingMark}`}
+            aria-hidden="true"
+          >
+            ◆
+          </span>
+          {content || " "}
+          {streaming && <span className={styles.caret} data-caret />}
+        </p>
+      )}
       {!editing && (
         <p className="mt-1 font-mono text-[0.6875rem] uppercase tracking-wide text-muted-foreground">
           draft {index + 1} — {wordCount(content)} words

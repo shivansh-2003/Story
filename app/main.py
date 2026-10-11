@@ -1,4 +1,5 @@
 import logging
+import asyncio
 import time
 from contextlib import asynccontextmanager
 
@@ -9,9 +10,19 @@ from app.auth import router as auth
 from app.chapters import router as chapters
 from app.characters import router as characters
 from app.core.logging_config import setup_logging
-from app.database import Base, engine
+from app.database import engine
+from pathlib import Path
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from app.generation import router as generation
 from app.stories import router as stories
+from app.transfers import router as transfers
+from app.planning import router as planning
+from app.rewriting import router as rewriting
+from app.transfers.upload_limit import ImportUploadLimit
+from app.manuscript import router as manuscript
+from app.jobs.worker import run_worker
+from sqlalchemy import text
 
 setup_logging()
 logger = logging.getLogger("story_assistant")
@@ -21,12 +32,21 @@ ALLOWED_ORIGINS = ["http://localhost:5173", "http://localhost:4173"]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # no migration tool — tables are created straight from the current models
-    # on boot. Fine for a single-schema-owner project; move to Alembic if
-    # this ever needs versioned migrations against a shared/prod database.
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
+    # Never partially change an existing schema on boot. Migrate explicitly first.
+    async with engine.connect() as conn:
+        try:
+            revision = await conn.scalar(text("SELECT version_num FROM alembic_version"))
+        except Exception as error:
+            raise RuntimeError("Database migrations required. See phase/phase1.md before starting the server.") from error
+        expected_revision = ScriptDirectory.from_config(Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))).get_current_head()
+        if revision != expected_revision:
+            raise RuntimeError("Run alembic upgrade head before starting the server.")
+    worker = asyncio.create_task(run_worker())
+    try:
+        yield
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
 
 
 app = FastAPI(title="Story Assistant API", lifespan=lifespan)
@@ -37,6 +57,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(ImportUploadLimit)
 
 
 @app.middleware("http")
@@ -74,6 +95,10 @@ app.include_router(characters.router)
 app.include_router(stories.router)
 app.include_router(chapters.router)
 app.include_router(generation.router)
+app.include_router(manuscript.router)
+app.include_router(transfers.router)
+app.include_router(planning.router)
+app.include_router(rewriting.router)
 
 
 @app.get("/health")

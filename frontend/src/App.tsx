@@ -26,6 +26,7 @@ const ChapterListPage = lazy(() =>
   import("@/features/chapters/ChapterListPage").then((m) => ({ default: m.ChapterListPage })),
 );
 const GalleyPage = lazy(() => import("@/features/galley/GalleyPage").then((m) => ({ default: m.GalleyPage })));
+const PlanningPage = lazy(() => import("@/features/planning/PlanningPage").then((m) => ({ default: m.PlanningPage })));
 
 function PageSkeleton() {
   return (
@@ -96,6 +97,7 @@ function App() {
             }
           >
             <Route index element={<Navigate to="chapters" replace />} />
+            <Route path="planning" element={<Suspense fallback={<PageSkeleton />}><PlanningPage /></Suspense>} />
             <Route
               path="chapters"
               element={

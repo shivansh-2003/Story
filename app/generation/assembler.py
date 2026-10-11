@@ -7,6 +7,7 @@ from app.characters.service import list_relationships_among
 from app.core.logging_utils import log_execution
 from app.database import async_session
 from app.generation import semantic_search
+from app.manuscript.memory import accepted_context
 from app.stories.models import Story
 
 MAX_PROMPT_TOKENS = 6000  # applies to the user message only — see _assemble_continue_user
@@ -59,6 +60,7 @@ async def build_continue_prompt(
     session_state: dict,
     instruction: str,
     length_words: int,
+    planning_context: dict | None = None,
 ) -> tuple[str, str]:
     """Used for: fresh generate, and regenerate-after-AI-draft (when pending_turn
     either doesn't exist or was AI-sourced, not user-edited).
@@ -77,22 +79,35 @@ async def build_continue_prompt(
     genuinely depends on the character IDs from the characters fetch (it's
     not independent — verified against the actual query before assuming
     otherwise), so it runs after, not folded into the same gather()."""
-    story, characters, prior_chapter_summaries, relevant_turns = await asyncio.gather(
+    planning_context = planning_context or {"text": "", "characters": None}
+
+    async def active_cast():
+        if planning_context["characters"] is not None:
+            return planning_context["characters"]
+        return await _fetch_active_characters(chapter_id)
+
+    story, characters, prior_chapter_summaries, relevant_turns, context = await asyncio.gather(
         _fetch_story(story_id),
-        _fetch_active_characters(chapter_id),
+        active_cast(),
         _fetch_prior_summaries(story_id, chapter_id),
         _fetch_relevant_turns(story_id, chapter_id, instruction),
+        accepted_context(chapter_id),
     )
     relationships = await _fetch_relationships([c.id for c in characters])
 
+    session_state["manuscript_revision"] = context["manuscript_revision"]
+
     system = _build_system_prompt(story, characters, relationships)
+    if planning_context["text"]:
+        system += "\n\nPlanning describes intended events, not established facts. Follow the writer's current instruction when it differs from the plan."
     user = _assemble_continue_user(
         prior_summaries=prior_chapter_summaries,
-        running_summary=session_state["running_summary"],
-        raw_tail=session_state["raw_tail"][-2:],  # last 1-2 paragraphs, always verbatim
+        running_summary=context["running_summary"],
+        raw_tail=context["raw_tail"],
         relevant_turns=relevant_turns,
         instruction=instruction,
         length_words=length_words,
+        planning_text=planning_context["text"],
     )
     return system, user
 
@@ -102,6 +117,7 @@ async def build_edit_prompt(
     story_id: uuid.UUID,
     session_state: dict,
     instruction: str,
+    planning_context: dict | None = None,
 ) -> tuple[str, str]:
     """Used for: edit-in-place, and regenerate-after-user-edit.
     Deliberately does NOT include raw_tail or prior chapter summaries —
@@ -114,9 +130,16 @@ async def build_edit_prompt(
 
     Same story/characters concurrency as build_continue_prompt — see there
     for why relationships isn't folded into the same gather()."""
+    planning_context = planning_context or {"text": "", "characters": None}
+
+    async def active_cast():
+        if planning_context["characters"] is not None:
+            return planning_context["characters"]
+        return await _fetch_active_characters(chapter_id)
+
     story, characters = await asyncio.gather(
         _fetch_story(story_id),
-        _fetch_active_characters(chapter_id),
+        active_cast(),
     )
     relationships = await _fetch_relationships([c.id for c in characters])
     pending = session_state["pending_turn"]
@@ -124,8 +147,11 @@ async def build_edit_prompt(
         raise ValueError("No pending turn to edit")
 
     system = _build_system_prompt(story, characters, relationships)
+    if planning_context["text"]:
+        system += "\n\nPlanning describes intended events, not established facts. Follow the writer's current edit instruction when it differs from the plan."
     user = "\n\n".join(
         [
+            planning_context["text"],
             f"Current draft text:\n{pending['content']}",
             f"Edit instruction: {instruction}",
             "Return only the revised paragraph(s), same approximate length.",
@@ -153,6 +179,7 @@ def _assemble_continue_user(
     relevant_turns: list[str],
     instruction: str,
     length_words: int,
+    planning_text: str = "",
 ) -> str:
     """Priority-ordered budget enforcement, cheapest-to-lose first:
     1. oldest prior-chapter summaries, one at a time
@@ -171,6 +198,7 @@ def _assemble_continue_user(
     retrieved = list(relevant_turns)
 
     protected = [
+        *([planning_text] if planning_text else []),
         f"Instruction: {instruction}",
         f"Write approximately {length_words} words. Continue directly — no preamble.",
     ]

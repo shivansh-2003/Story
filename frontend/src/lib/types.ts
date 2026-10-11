@@ -34,8 +34,10 @@ export type CharacterRelationship = {
 
 export type POV = "first_person" | "third_limited" | "third_omniscient";
 export type Tense = "past" | "present";
-export type StoryStatus = "draft" | "ongoing" | "on_hold" | "completed" | "abandoned";
-export type ChapterStatus = "draft" | "in_progress" | "in_review" | "complete" | "locked";
+export type StoryStatus =
+  "draft" | "ongoing" | "on_hold" | "completed" | "abandoned";
+export type ChapterStatus =
+  "draft" | "in_progress" | "in_review" | "complete" | "locked";
 
 export type Story = {
   id: UUID;
@@ -76,10 +78,46 @@ export type Chapter = {
 
 export type ChapterDetail = Chapter & {
   body: string;
+  turns: AcceptedTurn[];
+  manuscript_revision: number;
+  planning_revision: number;
+};
+
+export type AcceptedTurn = {
+  id: UUID;
+  sequence: number;
+  content: string;
+  instruction: string | null;
+  scene_id: UUID | null;
+  version: number;
+  source: string;
+  updated_at: string;
+};
+
+export type TurnRevision = {
+  id: UUID;
+  revision_number: number;
+  content: string;
+  source: string;
+  restored_from: number | null;
+  created_at: string;
+};
+
+export type ChapterSession = {
+  pending_turn: Turn | null;
+  sibling_attempts: Turn[];
+  version: number;
+  manuscript_revision: number;
+  planning_revision: number;
+  stale_draft: boolean;
 };
 
 export type Turn = {
   content: string;
   instruction: string | null;
   source: "ai" | "user_edit";
+  draft_id?: UUID;
+  base_revision?: number;
+  scene_id?: UUID | null;
+  base_planning_revision?: number;
 };

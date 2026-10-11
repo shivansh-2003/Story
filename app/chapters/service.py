@@ -45,7 +45,7 @@ async def list_chapters(db: AsyncSession, user: User, story_id: uuid.UUID) -> li
 
 @log_execution
 async def create_chapter(db: AsyncSession, user: User, story_id: uuid.UUID, body: ChapterCreate) -> Chapter:
-    await get_owned_story(db, story_id, user)
+    await get_owned_story(db, story_id, user, for_update=True)
 
     next_order_index = await db.scalar(
         select(func.coalesce(func.max(Chapter.order_index), -1) + 1).where(Chapter.story_id == story_id)
@@ -62,7 +62,7 @@ async def create_chapter(db: AsyncSession, user: User, story_id: uuid.UUID, body
 async def reorder_chapters(
     db: AsyncSession, user: User, story_id: uuid.UUID, body: ChapterReorderRequest
 ) -> None:
-    await get_owned_story(db, story_id, user)
+    await get_owned_story(db, story_id, user, for_update=True)
 
     chapter_ids = [item.chapter_id for item in body.items]
     result = await db.execute(
@@ -100,14 +100,11 @@ async def get_chapter_body(db: AsyncSession, chapter_id: uuid.UUID) -> str:
     # Rebuilt from chapter_turns on every read but only changes when a turn
     # is accepted, so it's cached in Redis and invalidated explicitly by
     # accept_pending — not a TTL-only cache.
-    cached = await session_store.get_cached_chapter_body(chapter_id)
-    if cached is not None:
-        return cached
+    # Read durable text: revisioned edits must not be hidden by an old Redis body.
     result = await db.execute(
         select(ChapterTurn.content).where(ChapterTurn.chapter_id == chapter_id).order_by(ChapterTurn.sequence)
     )
     body = "\n\n".join(result.scalars().all())
-    await session_store.set_cached_chapter_body(chapter_id, body)
     return body
 
 
@@ -218,6 +215,8 @@ async def get_prior_chapter_summaries(
             Chapter.story_id == story_id,
             Chapter.order_index < target_order,
             Chapter.chapter_summary.is_not(None),
+            Chapter.memory_revision == Chapter.manuscript_revision,
+            Chapter.is_archived.is_(False),
         )
         .order_by(Chapter.order_index)
     )

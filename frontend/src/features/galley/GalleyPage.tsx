@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronLeft, Lock, MoreHorizontal, Unlock } from "lucide-react";
@@ -24,7 +24,8 @@ import { AttemptsRail } from "./AttemptsRail";
 import { InSceneRail } from "./InSceneRail";
 import { InstructionConsole } from "./InstructionConsole";
 import { useChapterSession } from "./useChapterSession";
-import { useDebouncedManualEdit } from "./useDebouncedManualEdit";
+import { getMemoryStatus, refreshMemory } from "./generationApi";
+import { getScenes } from "@/features/planning/planningApi";
 
 type Length = "short" | "standard" | "long";
 
@@ -34,9 +35,11 @@ export function GalleyPage() {
   const {
     state,
     hydrate,
+    updateAccepted,
+    reloadSession,
     doGenerate,
     doEditInstruction,
-    doManualEdit,
+    saveManualEdit,
     doAccept,
     doDiscard,
     restoreSibling,
@@ -47,49 +50,89 @@ export function GalleyPage() {
   // The only fetch of this chapter — useChapterSession used to fetch it a
   // second time itself (see hydrate()'s comment), doubling the request and
   // the three sequential DB round trips behind it on every chapter open.
-  const { data: chapter } = useQuery({ queryKey: ["chapter", storyId, chapterId], queryFn: () => getChapter(storyId, chapterId) });
-  const syncManualEdit = useDebouncedManualEdit(storyId, chapterId, doManualEdit);
+  const { data: chapter } = useQuery({
+    queryKey: ["chapter", storyId, chapterId],
+    queryFn: () => getChapter(storyId, chapterId),
+  });
+  const memory = useQuery({
+    queryKey: ["chapter-memory", storyId, chapterId],
+    queryFn: () => getMemoryStatus(storyId, chapterId),
+    refetchInterval: (query) =>
+      ["queued", "running"].includes(query.state.data?.status ?? "")
+        ? 5000
+        : false,
+  });
 
   const [instruction, setInstruction] = useState("");
+  const [selectedScene, setSelectedScene] = useState<{chapterId:string; id:string}>({chapterId, id:""});
+  const scenes = useQuery({queryKey:["scenes",storyId,chapterId],queryFn:()=>getScenes(storyId,chapterId)});
+  const sceneId = selectedScene.chapterId === chapterId && scenes.data?.scenes.some(s=>s.id===selectedScene.id) ? selectedScene.id : null;
   const [length, setLength] = useState<Length>("standard");
   const [editing, setEditing] = useState(false);
-  const [justAcceptedIndex, setJustAcceptedIndex] = useState<number | null>(null);
+  const [justAcceptedIndex, setJustAcceptedIndex] = useState<number | null>(
+    null,
+  );
   const [renaming, setRenaming] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const [addCharacterBusy, setAddCharacterBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
-  const hydratedFor = useRef<string | null>(null);
   useEffect(() => {
-    if (!chapter || hydratedFor.current === chapterId) return;
-    hydratedFor.current = chapterId;
+    if (!chapter) return;
     hydrate(chapter);
   }, [chapter, chapterId, hydrate]);
 
-  const isBusy = state.status === "generating" || state.status === "accepting" || state.status === "completing";
+  const isBusy =
+    !state.ready ||
+    ["generating", "accepting", "completing", "saving"].includes(state.status);
   const streaming = state.status === "generating";
   const locked = chapter?.status === "locked";
 
   const rename = useMutation({
-    mutationFn: (title: string) => updateChapter(storyId, chapterId, { title: title || null }),
-    onSuccess: (updated) => queryClient.setQueryData(["chapter", storyId, chapterId], (prev: typeof chapter) => ({ ...prev!, ...updated })),
+    mutationFn: (title: string) =>
+      updateChapter(storyId, chapterId, { title: title || null }),
+    onSuccess: (updated) =>
+      queryClient.setQueryData(
+        ["chapter", storyId, chapterId],
+        (prev: typeof chapter) => ({ ...prev!, ...updated }),
+      ),
   });
 
   const toggleLock = useMutation({
-    mutationFn: () => (locked ? unlockChapter(storyId, chapterId) : lockChapter(storyId, chapterId)),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["chapter", storyId, chapterId] }),
+    mutationFn: () =>
+      locked
+        ? unlockChapter(storyId, chapterId)
+        : lockChapter(storyId, chapterId),
+    onSuccess: () =>
+      queryClient.invalidateQueries({
+        queryKey: ["chapter", storyId, chapterId],
+      }),
   });
 
   async function handleAccept() {
     const acceptedIndex = state.acceptedParagraphs.length;
-    await doAccept();
-    setJustAcceptedIndex(acceptedIndex);
-    setTimeout(() => setJustAcceptedIndex(null), 900);
+    if (await doAccept()) {
+      setJustAcceptedIndex(acceptedIndex);
+      setTimeout(() => setJustAcceptedIndex(null), 900);
+      queryClient.invalidateQueries({
+        queryKey: ["chapter", storyId, chapterId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["chapter-memory", storyId, chapterId],
+      });
+    }
   }
 
   async function handleComplete() {
     const completed = await doComplete();
-    if (completed) queryClient.invalidateQueries({ queryKey: ["chapter", storyId, chapterId] });
+    if (completed) {
+      queryClient.invalidateQueries({
+        queryKey: ["chapter", storyId, chapterId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["chapter-memory", storyId, chapterId],
+      });
+    }
   }
 
   function commitRename() {
@@ -101,9 +144,18 @@ export function GalleyPage() {
   async function handleAddCharacter(name: string, role: string) {
     setAddCharacterBusy(true);
     try {
-      const character = await createAndActivateCharacter(storyId, chapterId, { name, role: role || null });
-      setInstruction((prev) => (prev.trim() ? `${prev.trim()} ${character.name} enters the scene.` : `${character.name} enters the scene.`));
-      setNotice(`${character.name} joins from your next generation. The draft on the page is unchanged.`);
+      const character = await createAndActivateCharacter(storyId, chapterId, {
+        name,
+        role: role || null,
+      });
+      setInstruction((prev) =>
+        prev.trim()
+          ? `${prev.trim()} ${character.name} enters the scene.`
+          : `${character.name} enters the scene.`,
+      );
+      setNotice(
+        `${character.name} joins from your next generation. The draft on the page is unchanged.`,
+      );
     } catch (err) {
       setNotice((err as Error).message);
     } finally {
@@ -114,13 +166,21 @@ export function GalleyPage() {
   useKeyboardMap(
     {
       "mod+Enter": () => {
-        if (state.pendingTurn) return;
-        if (instruction.trim()) doGenerate(instruction, length);
+        if (state.pendingTurn || locked || isBusy || editing) return;
+        if (instruction.trim()) doGenerate(instruction, length, sceneId);
       },
-      "mod+k": () => state.pendingTurn && !isBusy && handleAccept(),
-      "mod+e": () => state.pendingTurn && !isBusy && setEditing(true),
-      "mod+Backspace": () => state.pendingTurn && !isBusy && doDiscard(),
-      Escape: () => (editing ? setEditing(false) : stopGenerating()),
+      "mod+k": () =>
+        state.pendingTurn && !isBusy && !locked && !editing && handleAccept(),
+      "mod+e": () =>
+        state.pendingTurn && !isBusy && !locked && setEditing(true),
+      "mod+Backspace": () =>
+        state.pendingTurn && !isBusy && !locked && !editing && doDiscard(),
+      Escape: () => {
+        if (editing) {
+          setEditing(false);
+          void reloadSession();
+        } else stopGenerating();
+      },
     },
     !!chapter,
   );
@@ -167,7 +227,11 @@ export function GalleyPage() {
           </h1>
         )}
         <StatusPill status={chapter.status} kind="chapter" />
-        {locked ? <Lock className="size-4 text-muted-foreground" /> : <Unlock className="size-4 text-muted-foreground" />}
+        {locked ? (
+          <Lock className="size-4 text-muted-foreground" />
+        ) : (
+          <Unlock className="size-4 text-muted-foreground" />
+        )}
 
         <div className="ml-auto">
           <DropdownMenu>
@@ -176,15 +240,26 @@ export function GalleyPage() {
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               {state.pendingTurn ? (
-                <DropdownMenuItem disabled title="Resolve the draft on the page first — keep it or throw it away.">
+                <DropdownMenuItem
+                  disabled
+                  title="Resolve the draft on the page first — keep it or throw it away."
+                >
                   Complete chapter
                 </DropdownMenuItem>
               ) : (
-                <DropdownMenuItem onSelect={handleComplete} disabled={isBusy}>
+                <DropdownMenuItem
+                  onSelect={handleComplete}
+                  disabled={isBusy || locked}
+                >
                   Complete chapter
                 </DropdownMenuItem>
               )}
-              <DropdownMenuItem onSelect={() => toggleLock.mutate()}>{locked ? "Unlock" : "Lock"}</DropdownMenuItem>
+              <DropdownMenuItem
+                disabled={isBusy || editing}
+                onSelect={() => toggleLock.mutate()}
+              >
+                {locked ? "Unlock" : "Lock"}
+              </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
@@ -193,20 +268,41 @@ export function GalleyPage() {
       <div className="mt-6 grid grid-cols-1 gap-8 lg:grid-cols-[12rem_1fr_10rem]">
         <InSceneRail onAdd={handleAddCharacter} busy={addCharacterBusy} />
 
-        <div className={chapter.status === "complete" ? "opacity-60" : undefined}>
+        <div
+          className={chapter.status === "complete" ? "opacity-60" : undefined}
+        >
+          <div className="mb-5 space-y-2">
+            <label className="block space-y-1 text-sm">Scene for next generation (optional)
+              <select className="block w-full rounded-md border bg-background p-2" value={state.pendingTurn ? state.pendingTurn.scene_id ?? "" : sceneId ?? ""}
+                disabled={isBusy||editing||locked||!!state.pendingTurn||scenes.isLoading} onChange={e=>setSelectedScene({chapterId,id:e.target.value})}>
+                <option value="">No scene — use chapter context and cast</option>
+                {state.pendingTurn?.scene_id && !scenes.data?.scenes.some(s=>s.id===state.pendingTurn!.scene_id) && <option value={state.pendingTurn.scene_id}>Scene removed — review this draft</option>}
+                {scenes.data?.scenes.map(scene=><option key={scene.id} value={scene.id}>{scene.order_index+1}. {scene.title}</option>)}
+              </select>
+            </label>
+            <Link className="text-sm underline" to={`/stories/${storyId}/planning?chapter=${chapterId}`}>Plan this chapter and its scenes</Link>
+            {scenes.isError && <p role="alert" className="text-sm text-destructive">Scene list unavailable. You can continue without a selected scene. <button className="underline" onClick={()=>scenes.refetch()}>Retry</button></p>}
+            {state.pendingTurn && <p className="text-xs text-muted-foreground">The pending draft keeps the scene it was generated for. Choose a scene for the next paragraph after resolving it.</p>}
+          </div>
           <Sheet
+            storyId={storyId}
+            chapterId={chapterId}
+            locked={locked}
+            onAcceptedSaved={updateAccepted}
             paragraphs={state.acceptedParagraphs}
+            sceneTitles={Object.fromEntries((scenes.data?.scenes ?? []).map(scene=>[scene.id,scene.title]))}
             justAcceptedIndex={justAcceptedIndex}
             pendingTurn={state.pendingTurn}
             streaming={streaming}
             editing={editing}
-            busy={isBusy}
-            onManualEdit={syncManualEdit}
-            onEditSave={(content) => {
-              syncManualEdit(content);
-              setEditing(false);
+            busy={isBusy || locked}
+            onEditSave={async (content) => {
+              if (await saveManualEdit(content)) setEditing(false);
             }}
-            onEditCancel={() => setEditing(false)}
+            onEditCancel={() => {
+              setEditing(false);
+              void reloadSession();
+            }}
             onKeep={handleAccept}
             onRewrite={doEditInstruction}
             onEdit={() => setEditing(true)}
@@ -214,7 +310,49 @@ export function GalleyPage() {
           />
 
           {notice && <p className="mt-3 text-sm text-marigold">{notice}</p>}
-          {state.errorMessage && <p className="mt-3 text-sm text-destructive">{state.errorMessage}</p>}
+          {state.errorMessage && (
+            <p className="mt-3 text-sm text-destructive">
+              {state.errorMessage}{" "}
+              <button
+                className="underline"
+                onClick={() =>
+                  reloadSession().catch((e: Error) => setNotice(e.message))
+                }
+              >
+                Reload draft
+              </button>
+            </p>
+          )}
+          {state.staleDraft && (
+            <p role="status" className="mt-3 text-sm text-marigold">
+              This draft was written before the manuscript or planning changed. Review and
+              save it, or rewrite it, before keeping it.
+            </p>
+          )}
+          {memory.data && !memory.data.fresh && (
+            <p role="status" className="mt-3 text-sm text-muted-foreground">
+              {memory.data.status === "failed"
+                ? "AI memory refresh failed. Your manuscript is saved."
+                : memory.data.status === "not_requested"
+                ? "AI memory has not been refreshed. New generation uses current manuscript text."
+                : "AI memory is updating. New generation uses current manuscript text."}
+              {["failed", "not_requested"].includes(memory.data.status) && (
+                <button
+                  className="ml-2 underline"
+                  onClick={async () => {
+                    try {
+                      await refreshMemory(storyId, chapterId);
+                      await memory.refetch();
+                    } catch (e) {
+                      setNotice((e as Error).message);
+                    }
+                  }}
+                >
+                  {memory.data.status === "not_requested" ? "Refresh AI memory" : "Retry memory refresh"}
+                </button>
+              )}
+            </p>
+          )}
 
           <InstructionConsole
             instruction={instruction}
@@ -224,12 +362,25 @@ export function GalleyPage() {
             generating={streaming}
             locked={locked}
             onUnlock={() => toggleLock.mutate()}
-            onSubmit={() => instruction.trim() && !state.pendingTurn && doGenerate(instruction, length)}
+            disabled={isBusy || editing || !!state.pendingTurn}
+            onSubmit={() =>
+              instruction.trim() &&
+              !state.pendingTurn &&
+              !isBusy &&
+              !locked &&
+              !editing &&
+              doGenerate(instruction, length, sceneId)
+            }
             onStop={stopGenerating}
           />
         </div>
 
-        <AttemptsRail attempts={state.siblingAttempts} onRestore={restoreSibling} />
+        <AttemptsRail
+          attempts={state.siblingAttempts}
+          onRestore={(turn) =>
+            !isBusy && !locked && !editing && restoreSibling(turn)
+          }
+        />
       </div>
     </div>
   );
