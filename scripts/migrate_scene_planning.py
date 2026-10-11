@@ -1,4 +1,4 @@
-"""Upgrade Phase 2 to Phase 3 with a private snapshot and row-preservation checks."""
+"""Add scene planning to a database with manuscript imports with a private snapshot and row-preservation checks."""
 
 import asyncio
 import json
@@ -11,7 +11,7 @@ from sqlalchemy import inspect, text
 
 from alembic import command
 from app.database import engine
-from scripts.migrate_phase2 import canonical, read_tables
+from scripts.migrate_manuscript_imports import canonical, read_tables
 
 
 def migrate(connection):
@@ -21,10 +21,10 @@ def migrate(connection):
         text(f"SELECT version_num FROM {quote(schema)}.alembic_version")
     )
     if revision in {"0004_phase3", "0005_phase4"}:
-        print("Phase 3 is already applied.")
+        print("Scene planning migration is already applied.")
         return
     if revision != "0003_phase2":
-        raise RuntimeError("Phase 2 must be migrated first. No changes applied.")
+        raise RuntimeError("Manuscript imports must be migrated first. No changes applied.")
     names = sorted(inspect(connection).get_table_names(schema=schema))
     if any(name in names for name in ("chapter_plans", "scenes", "scene_characters")):
         raise RuntimeError(
@@ -82,7 +82,7 @@ def migrate(connection):
             raise RuntimeError("Unexpected planning records; rolling back.")
     print(f"Private pre-migration data snapshot: {path.resolve()}")
     print(
-        f"Phase 3 applied. All {len(names) - 1} existing application tables preserved; planning revisions start at 0 and paragraph scene links at NULL."
+        f"Scene planning migration applied. All {len(names) - 1} existing application tables preserved; planning revisions start at 0 and paragraph scene links at NULL."
     )
 
 

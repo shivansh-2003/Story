@@ -1,6 +1,6 @@
 """Read-only recovery verification and private application-data snapshot.
 
-Run with PYTHONPATH=. venv/bin/python scripts/verify_phase1_recovery.py.
+Run with PYTHONPATH=. venv/bin/python scripts/verify_manuscript_recovery.py.
 STORY_RECOVERY_DATABASE_URL optionally selects a historical recovery branch.
 This script never writes to PostgreSQL. The JSON snapshot is data, not a schema dump.
 """
@@ -77,7 +77,7 @@ async def main():
                 version = tables.get("alembic_version", [])
                 if version not in ([{"version_num": "0002_phase1"}], [{"version_num": "0003_phase2"}], [{"version_num": "0004_phase3"}], [{"version_num": "0005_phase4"}]) or missing_history:
                     raise RuntimeError(
-                        "Phase 1 schema/current revision history is incomplete."
+                        "Manuscript schema/current revision history is incomplete."
                     )
         directory = Path("logs")
         directory.mkdir(exist_ok=True)

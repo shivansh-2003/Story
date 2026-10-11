@@ -76,7 +76,7 @@ def log_execution(func: Callable | None = None, *, label: str | None = None):
     which is what section 3's STREAM_TTFT/STREAM_TOTAL labels need; there's
     no separate "streaming instrumentation" to hand-write, this covers it.
 
-    Usage: @log_execution or @log_execution(label="PREPARE_PHASE")."""
+    Usage: @log_execution or @log_execution(label="GENERATION_PREPARE")."""
 
     def decorator(fn: Callable) -> Callable:
         logger = logging.getLogger(fn.__module__)
@@ -91,8 +91,9 @@ def log_execution(func: Callable | None = None, *, label: str | None = None):
                 logger.info("%s START %s", tag, _safe_args(fn, args, kwargs))
                 first_chunk_at: float | None = None
                 chunks = 0
+                stream = fn(*args, **kwargs)
                 try:
-                    async for item in fn(*args, **kwargs):
+                    async for item in stream:
                         if first_chunk_at is None:
                             first_chunk_at = time.perf_counter()
                             logger.info("%s STREAM_TTFT %.1fms", tag, (first_chunk_at - start) * 1000)
@@ -105,6 +106,8 @@ def log_execution(func: Callable | None = None, *, label: str | None = None):
                     elapsed = (time.perf_counter() - start) * 1000
                     logger.error("%s FAILED after %.1fms: %s: %s", tag, elapsed, type(e).__name__, e)
                     raise
+                finally:
+                    await stream.aclose()
 
             return async_gen_wrapper
 
@@ -147,8 +150,7 @@ def log_cache_event(key: str, hit: bool, source: str) -> None:
     """CACHE_HIT / CACHE_MISS, keyed and attributed to the calling function —
     greppable now, ready to wire into a real cache layer later. Used today
     against session_store's Redis reads (session state, not a cache, but the
-    same read-or-miss shape) and left as a # TODO at the caching candidates
-    identified in the backend optimization pass."""
+    same read-or-miss shape)."""
     logger = logging.getLogger(source)
     logger.info("%s key=%s", "CACHE_HIT" if hit else "CACHE_MISS", key)
 

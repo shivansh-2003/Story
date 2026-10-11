@@ -1,13 +1,11 @@
 import uuid
 
-from openai import AsyncOpenAI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.chapters.models import Chapter
-from app.config import get_settings
+from app.core.llm_client import embed_text
 from app.core.logging_utils import log_execution
-from app.generation.embedder import EMBEDDING_MODEL
 from app.generation.models import ChapterTurn
 
 TOP_K = 3
@@ -18,10 +16,7 @@ MAX_DISTANCE = 0.35
 
 @log_execution
 async def embed_query(text: str) -> list[float]:
-    settings = get_settings()
-    client = AsyncOpenAI(api_key=settings.openai_api_key)
-    response = await client.embeddings.create(model=EMBEDDING_MODEL, input=text)
-    return response.data[0].embedding
+    return await embed_text(text)
 
 
 @log_execution

@@ -1,4 +1,4 @@
-"""Verify the pre-phase-1 schema before optionally stamping its Alembic baseline.
+"""Verify the pre-manuscript-history schema before optionally stamping its Alembic baseline.
 
 Read-only by default. Stop the backend before running with --stamp and upgrading.
 """
@@ -62,7 +62,7 @@ def verify(connection):
             # Accept only matching, empty tables; never discard existing history or jobs.
             if connection.scalar(text(f"SELECT count(*) FROM {table.name}")):
                 raise RuntimeError(
-                    f"Unversioned phase-1 table contains data: {table.name}"
+                    f"Unversioned manuscript-history table contains data: {table.name}"
                 )
         if table.name not in names:
             raise RuntimeError(f"Missing baseline table: {table.name}")
@@ -161,11 +161,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--stamp",
         action="store_true",
-        help="Stamp the verified pre-phase-1 baseline; does not add phase-1 tables.",
+        help="Stamp the verified pre-manuscript-history baseline; does not add manuscript-history tables.",
     )
     args = parser.parse_args()
     asyncio.run(check())
-    print("Existing schema matches the pre-phase-1 baseline.")
+    print("Existing schema matches the pre-manuscript-history baseline.")
     if args.stamp:
         command.stamp(Config("alembic.ini"), "0001_baseline")
         print("Baseline stamped. Run alembic upgrade head next.")

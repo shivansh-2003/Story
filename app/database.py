@@ -1,6 +1,7 @@
 import logging
 import time
 import uuid
+from functools import wraps
 from collections.abc import AsyncGenerator
 
 from sqlalchemy import event
@@ -25,7 +26,34 @@ engine = create_async_engine(
     connect_args=connect_args,
 )
 
-async_session = async_sessionmaker(engine, expire_on_commit=False)
+
+def _measure_checkout(method):
+    @wraps(method)
+    async def measured(self, *args, **kwargs):
+        if not self.in_transaction():
+            start = time.perf_counter()
+            await self.connection()
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            if elapsed_ms > 50:
+                pool = engine.sync_engine.pool
+                logger.warning(
+                    "connection acquisition took %.1fms (checked_out=%s overflow=%s)",
+                    elapsed_ms, pool.checkedout(), pool.overflow(),
+                )
+        return await method(self, *args, **kwargs)
+    return measured
+
+
+class MeasuredAsyncSession(AsyncSession):
+    """Time actual connection checkout, rather than lazy session creation."""
+
+    execute = _measure_checkout(AsyncSession.execute)
+    scalar = _measure_checkout(AsyncSession.scalar)
+    scalars = _measure_checkout(AsyncSession.scalars)
+    get = _measure_checkout(AsyncSession.get)
+
+
+async_session = async_sessionmaker(engine, class_=MeasuredAsyncSession, expire_on_commit=False)
 
 
 @event.listens_for(engine.sync_engine, "before_cursor_execute")
@@ -50,28 +78,6 @@ def uuid_pk() -> Mapped[uuid.UUID]:
     return mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
 
-_last_release_at: float | None = None
-
-
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    global _last_release_at
-    start = time.perf_counter()
     async with async_session() as session:
-        wait_ms = (time.perf_counter() - start) * 1000
-        if wait_ms > 50:
-            # distinguishes two causes that look identical from the outside
-            # (a slow request next to a fast one): a large idle_gap points at
-            # Neon compute auto-suspend/cold-start; a high checked_out count
-            # relative to pool_size points at concurrent-request pool
-            # contention (e.g. duplicate frontend fetches) instead.
-            pool = engine.sync_engine.pool
-            gap_s = None if _last_release_at is None else start - _last_release_at
-            logger.warning(
-                "connection acquisition took %.1fms (checked_out=%s overflow=%s idle_gap=%s)",
-                wait_ms,
-                pool.checkedout(),
-                pool.overflow(),
-                f"{gap_s:.1f}s" if gap_s is not None else "n/a",
-            )
         yield session
-    _last_release_at = time.perf_counter()

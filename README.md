@@ -1,1035 +1,644 @@
 # Story Assistant
 
-> **Phase 1 update (10 October 2026):** Accepted paragraphs now support editing,
-> immutable revision history, and restoration. Memory refresh jobs use content
-> versions so old summaries and embeddings cannot overwrite new prose.
-> See [phase/phase1.md](phase/phase1.md) for implementation and rollout details.
-> Database startup now requires Alembic migrations; the older architecture
-> descriptions below should be read alongside that report.
+Story Assistant is a web app for writing fiction with AI while keeping the writer in control. Build a story bible and cast, organize chapters, generate prose a paragraph at a time, and approve each draft before it enters the manuscript. You can also import existing writing, edit accepted paragraphs, plan scenes, and request targeted AI rewrites.
 
-A full-stack app for co-writing fiction with an AI, one paragraph at a time.
-You create characters and a story, break the story into chapters, and then —
-chapter by chapter — ask the AI to write the next bit, read what it wrote,
-either keep it or throw it away and try again, and repeat until the chapter
-is done.
 
-This document covers the whole system: what it does, how it's built, how a
-user actually moves through it, the architectural decisions that shape the
-backend and the LLM workflow, a folder-by-folder tour of the codebase, and
-how to get it running.
+## Features
 
----
+- **Story bible:** define the premise, genre, tone, setting, POV, tense, and writing preferences that guide generation.
+- **Reusable characters:** maintain character sheets and relationships, reuse characters across stories, and choose the active chapter cast.
+- **Chapter management:** create, rename, reorder, archive, complete, lock, unlock, and reopen chapters.
+- **Streamed AI writing:** describe what happens next and watch prose arrive, with a choice of approximate response length.
+- **Draft review:** keep, rewrite, manually edit, discard, or restore an alternate draft before accepting prose.
+- **Draft recovery:** recover pending work after reload and handle conflicting changes from another tab or session.
+- **Accepted prose editing:** refine saved paragraphs, browse immutable revision history, and restore earlier text as a new revision.
+- **Manuscript import/export:** preview text or Markdown imports, choose the chapters to append, and export accepted writing.
+- **Optional planning:** save chapter objectives and ordered scenes with their goals, cast, and POV.
+- **AI planning suggestions:** review and edit suggested plans before explicitly saving them.
+- **Targeted AI rewriting:** rewrite one paragraph or selection, compare the result, then apply or cancel it.
+- **AI memory and retrieval:** refresh chapter summaries and retrieve relevant accepted passages for later generation.
+- **Provider choice:** configure OpenAI or local Ollama for prose, summaries, planning, and rewrites.
 
-## 1. What the app is about
+### Story bible and reusable characters
 
-Most "AI writing" tools either generate a whole story in one shot (low
-control, generic output) or act as a blank-page autocomplete (no persistent
-sense of who the characters are or what already happened). This app sits
-between those: it keeps a durable **story bible** and **character sheets**
-that get fed into every generation call, and it treats each AI-written
-paragraph as a **draft** the writer explicitly approves before it becomes
-permanent — never auto-committed, never silently rewritten.
+Each story has a title, premise, genre, tone, point of view, tense, setting, themes, content boundaries, audience, and writing-style notes. Character sheets hold appearance, voice, personality, motivation, flaws, and backstory. Directional relationships describe how characters relate to one another.
 
-The three things it's actually optimized for:
+Import characters into a story and choose the active cast for each chapter. The Galley also lets you create and activate a character while writing. A cast change affects later generation; it does not rewrite an existing draft.
 
-- **Continuity** — characters, relationships, and prior chapters are
-  structured data, not something re-typed into a prompt by hand each time.
-- **Control** — nothing the AI writes is final until the writer accepts it;
-  every draft can be edited, regenerated, or discarded first.
-- **Speed of iteration** — generation streams token-by-token, and the
-  "try again" loop (regenerate → discard → regenerate) never touches the
-  database, so experimenting is cheap.
+### Chapter management
 
----
+Create and rename chapters, reorder them within a story, set a target word count, and archive chapters while retaining their accepted writing. Complete a chapter after resolving its pending draft. Locking protects the prose; unlocking makes it available for further work.
 
-## 2. System architecture
+Story status is managed separately from chapter status. Finishing one chapter does not automatically mark the story complete.
 
-```mermaid
-flowchart LR
-    Browser["React SPA\n(frontend/)"]
-
-    subgraph Backend["FastAPI backend (app/)"]
-        Routers["auth / characters / stories\n/ chapters routers"]
-        Gen["generation package\n(the writing loop)"]
-        LLMClient["core/llm_client.py"]
-        Routers --> Gen
-        Gen --> LLMClient
-    end
-
-    Browser -- "HTTP JSON (CRUD)" --> Routers
-    Browser -- "HTTP SSE (streamed prose)" --> Gen
-    Routers -- "durable reads/writes" --> PG[(Postgres — Neon)]
-    Gen -- "durable reads/writes" --> PG
-    Gen -- "in-progress draft,\nsession state" --> Redis[(Redis)]
-    LLMClient -- "prompt / streamed tokens" --> LLM["OpenAI or local Ollama"]
-```
-
-Three storage systems, each with exactly one job:
-
-- **Postgres (Neon)** — the permanent record: users, stories, characters,
-  chapters, and every paragraph that's been *accepted*. If it's in
-  Postgres, it's final.
-- **Redis** — short-term memory for whichever chapter is actively being
-  written: the AI's current draft (not yet accepted), the last few
-  alternate drafts, and a running summary of the chapter so far. Losing it
-  loses an in-progress draft, never finished work.
-- **OpenAI or Ollama** — whichever is configured (`LLM_PROVIDER`). The only
-  part that costs money or needs a GPU.
-
-The frontend is a plain client-side SPA — no server-side rendering, a
-bearer JWT in `localStorage`, talking to the backend over JSON for CRUD and
-Server-Sent Events for generation.
-
----
-
-## 3. User workflow
-
-```mermaid
-sequenceDiagram
-    actor W as Writer
-    participant FE as Frontend
-    participant BE as Backend
-    participant Redis
-    participant LLM
-
-    W->>FE: sign up / log in
-    W->>FE: create characters (name, role, voice, backstory…)
-    W->>FE: create a story (bible: genre, tone, POV, themes…)
-    W->>FE: import characters into the story
-    W->>FE: create a chapter, mark active characters
-
-    rect rgb(245, 245, 250)
-    note over W,LLM: the writing loop — repeats many times per chapter
-    W->>FE: type an instruction, click Generate
-    FE->>BE: POST .../generate (SSE)
-    BE->>LLM: system(bible+cast) + user(context+instruction)
-    LLM-->>BE: tokens, streamed
-    BE-->>FE: tokens, streamed
-    FE-->>W: draft appears word-by-word ("pencil" styling)
-    alt writer likes it
-        W->>FE: Accept
-        FE->>BE: POST .../accept
-        BE->>Redis: clear pending draft
-        note over BE: paragraph becomes a permanent chapter_turns row
-    else writer wants changes
-        W->>FE: type a note, click Edit or Regenerate
-        FE->>BE: POST .../generate/edit (SSE)
-    else writer doesn't want it
-        W->>FE: Discard
-        FE->>BE: POST .../discard
-    end
-    end
-
-    W->>FE: Mark chapter complete
-    FE->>BE: POST .../complete
-    BE-->>BE: background: summarize chapter for future context
-```
-
-A few things that matter about this loop:
-
-- **Nothing the AI writes is real until accepted.** Regenerating,
-  discarding, and hand-editing all happen in Redis — the writer can
-  experiment freely without touching the database.
-- **Adding a character mid-chapter** doesn't retroactively rewrite the
-  pending draft — it only affects the *next* generation call, and the UI
-  says so explicitly.
-- **Completing a chapter** triggers a background job that summarizes it, so
-  *future* chapters remember what happened without re-reading the whole
-  thing.
-
----
-
-## 4. Core functionality — from the writer's point of view
-
-This is what the app actually gets you, day to day:
-
-- **Build a cast once, reuse it everywhere.** Write a character's voice,
-  backstory, and personality a single time. Every scene they're active in
-  automatically carries that context into generation — you're never
-  re-explaining "she's sarcastic and still grieving her sister" in every
-  prompt by hand.
-- **Give the AI a story bible instead of a blank page.** Genre, tone, POV,
-  tense, themes, content boundaries, target audience, writing-style
-  notes — set once per story, and every generation call respects them
-  without you repeating yourself.
-- **Nothing lands in your manuscript without your say-so.** Every AI
-  paragraph is a draft first, shown in a visually distinct "pencil" style.
-  Read it, then decide: keep it, ask for a rewrite, or throw it away. The
-  actual chapter text never changes until you explicitly accept.
-- **Trying five different openings costs nothing.** Regenerating or
-  discarding a draft never touches the database — only accepting does. You
-  can iterate on a paragraph as many times as you want with zero
-  consequence to the real manuscript.
-- **Watch it write, don't wait for it.** Generation streams word-by-word
-  instead of appearing all at once after a long pause — you can tell within
-  a sentence or two whether a draft is worth reading to the end.
-- **Add a character mid-scene without breaking your flow.** Realize you
-  need someone new halfway through writing? Create them and drop them into
-  the current chapter in one step — the UI nudges "[Name] enters the
-  scene" into your next instruction and is explicit that it only affects
-  the *next* generation, not the draft you're currently looking at.
-- **The story remembers, so you don't have to re-explain it.** Finish a
-  chapter and it's summarized automatically in the background. Every later
-  chapter's generation calls include what already happened — no manually
-  copy-pasting a recap into the prompt.
-- **A finished chapter can't be regenerated out from under you by
-  accident.** Lock a chapter once you consider it truly done, and
-  generation is blocked until you explicitly unlock it again.
-- **You always know exactly where a story or chapter stands.** Stories move
-  through `draft → ongoing → (on hold, or finished, or abandoned)`.
-  Chapters move through `draft → being written → awaiting your review →
-  complete → (optionally) locked`. Status is never a guess.
-- **A relationship between two characters actually shapes the prose.**
-  Mark two characters as "sworn enemies who used to be lovers" and that
-  context reaches the model whenever they're in a scene together — it's
-  not just metadata sitting unused in a database.
-
-### Quick reference
-
-| Area | What it does |
-|---|---|
-| **Auth** | Email/password signup and login, JWT bearer tokens. |
-| **Characters** | Full sheet (name, role, age, pronouns, appearance, voice notes, personality traits, motivation, flaw, backstory) plus directional relationships between characters. |
-| **Stories** | Story bible (title, genre, tone, POV, tense, rating, premise, opening line, setting, themes, content boundaries, writing style notes, target audience) plus which characters are imported into it. |
-| **Chapters** | Ordered within a story, own active-character subset, reorderable, archivable, lockable. |
-| **The writing loop** | Streamed generation, edit-in-place, regenerate (keeps discarded drafts as restorable "sibling attempts", up to 3), manual hand-editing, accept, discard. `/generate` and `/generate/edit` are per-user token-bucket rate limited (burst 10, ~10/min sustained) — a 429 with `Retry-After` if exceeded. |
-| **Continuity** | Two background summarization triggers: one compacts a long chapter's older text as it's written; one summarizes a completed chapter for future chapters to reference. A character's `condensed_summary` is auto-generated in the background on create/update, feeding directly into every generation prompt. |
-| **Session integrity** | A chapter's Redis session state is optimistic-locked (Redis `WATCH`/`MULTI`/`EXEC` on a `version` field) — a concurrent write from another tab/request raises `SessionConflict`, surfaced as `409` on `/accept` and `/discard`. |
-| **Status lifecycle** | Stories: `draft → ongoing ⇄ on_hold → completed/abandoned` (reopenable). Chapters: `draft → in_progress → in_review → complete → locked` (reversible). |
-
----
-
-## 5. Major architectural decisions
-
-### From the LLM-workflow point of view
-
-**System/user message split, not one flat prompt.**
-
-```mermaid
-flowchart TB
-    subgraph Before["Before"]
-        direction TB
-        B1["bible + characters + relationships\n+ prior summaries + running summary\n+ raw tail + instruction"]
-        B1 --> B2["joined into one string"]
-        B2 --> B3["single user message,\nfront-truncated on overflow"]
-    end
-    subgraph After["After"]
-        direction TB
-        A1["SYSTEM: bible + characters + relationships\n— identical across every regenerate/edit"]
-        A2["USER: prior summaries + running summary\n+ raw tail + instruction — changes per call"]
-    end
-    Before -. refactor .-> After
-    style B3 fill:#ffcdd2
-    style A1 fill:#c8e6c9
-```
-
-The story bible, active characters, and their relationships are stable
-across every regenerate/edit within a chapter — they go in `system`. Prior
-summaries, recent text, and the instruction change per call — they go in
-`user`. This enables prefix reuse (OpenAI's automatic cache above ~1024
-tokens; Ollama's own KV-cache with no minimum) and, as a side effect, means
-budget trimming can never eat into the bible by accident.
-
-**Section-aware budget trimming, not blind truncation.**
-
-```mermaid
-flowchart TD
-    Start["prompt over budget?"] -->|yes| D1["drop oldest\nprior-chapter summary"]
-    D1 --> C1{"under budget\nnow?"}
-    C1 -->|no| D2["drop the running_summary\n(already a 2-4 sentence rollup)"]
-    D2 --> C2{"under budget\nnow?"}
-    C2 -->|no| D3["drop the older of the two\nraw_tail paragraphs"]
-    D3 --> C3{"under budget\nnow?"}
-    C3 -->|no| Send["🔒 send anyway —\ninstruction is NEVER trimmed"]
-    C1 -->|yes| Done["done"]
-    C2 -->|yes| Done
-    C3 -->|yes| Done
-    style Send fill:#fff3cd
-    style Done fill:#c8e6c9
-```
-
-Content is dropped in explicit priority order when a prompt is too long —
-cheapest-to-lose first. The instruction and, on the edit path, the current
-draft are never trimmed, even if that means sending an over-budget prompt.
-
-**Streaming forced a real architectural split, not just a flag.**
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant R as router.py
-    participant P as prepare_*()
-    participant DB as Postgres
-    participant G as generator (stream_model)
-    participant Rd as Redis
-
-    C->>R: POST /generate
-    R->>P: prepare_continue(db, ...)
-    P->>DB: fetch story, characters, relationships
-    DB-->>P: rows
-    P-->>R: (system, user, state)
-    Note over R: db session still valid here — the ONLY place<br/>this action touches the database
-    R-->>C: StreamingResponse begins (200)
-    Note over R,DB: FastAPI tears down the db session NOW,<br/>the instant the handler returns
-    R->>G: generate_continue(system, user, ...)
-    loop each token
-        G-->>C: SSE delta
-    end
-    G->>Rd: save_session (its own fresh session, not the request's)
-```
-
-FastAPI tears down a `Depends(get_db)` session the instant a route handler
-*returns* — for a `StreamingResponse` that happens immediately, before the
-generator body has run at all. So every generation action is split into a
-`prepare_*` step (all DB work, while the session is valid) and a pure
-streaming generator (no DB access at all, just tokens in and out, then a
-Redis write at the end).
-
-**Ollama gets its own code path, not the OpenAI-compatible shim it also
-exposes.**
-
-```mermaid
-flowchart LR
-    subgraph Compat["Ollama's OpenAI-compat shim"]
-        C1["POST /v1/chat/completions"] --> C2["think:false IGNORED"]
-        C2 --> C3["reasoning model burns whole\nbudget on invisible &lt;think&gt;"]
-        C3 --> C4["❌ empty content"]
-    end
-    subgraph Native["Ollama's native endpoint"]
-        N1["POST /api/chat"] --> N2["think:false HONORED"]
-        N2 --> N3["✅ real content"]
-    end
-    style C4 fill:#ffcdd2
-    style N3 fill:#c8e6c9
-```
-
-Verified directly: Ollama's OpenAI-compat endpoint silently ignores
-`"think": false`, so a reasoning model (`qwen3.6`) burns its entire token
-budget on invisible chain-of-thought and returns empty content. Its native
-`/api/chat` endpoint honors the flag correctly, so that's what's actually
-called for the Ollama provider.
-
-**Retry/backoff only on non-streaming calls.**
-
-```mermaid
-flowchart TD
-    Fail["an LLM call fails"] --> Q{"live generation, or\nbackground summarization?"}
-    Q -->|live| Live["surfaces as an in-band SSE\nerror frame — writer sees it,\nclicks generate again"]
-    Q -->|background| BG["chapter_summary stays NULL\nforever — silent, permanent,\ndegrades every future chapter's context"]
-    Live --> NoRetry["no retry needed"]
-    BG --> Retry["3 attempts, exponential backoff"]
-    style Live fill:#c8e6c9
-    style BG fill:#ffcdd2
-    style Retry fill:#c8e6c9
-```
-
-Retry effort goes where the failure mode is actually dangerous — a live
-failure is visible and cheaply retried by the user; a background failure
-is invisible and permanent unless the code itself retries.
-
-**A manual resummarize endpoint exists as an escape hatch.**
-
-```mermaid
-flowchart LR
-    A["chapter_summary never landed\n(retries exhausted)"] --> B["POST .../resummarize"]
-    B --> C["re-fires the same background job\n/complete already schedules"]
-    C --> D{"live Redis session\nstill exists?"}
-    D -->|yes| E["summarize from session state"]
-    D -->|no, expired| F["fall back to durable\nchapter_turns reconstruction"]
-```
-
-### From the backend point of view
-
-**Domain folders, not layer folders.**
-
-```mermaid
-flowchart LR
-    subgraph Layer["by layer — rejected"]
-        direction TB
-        L1["models/ — every table"]
-        L2["schemas/ — every request shape"]
-        L3["services/ — every business rule"]
-        L4["routers/ — every endpoint"]
-    end
-    subgraph Domain["by domain — used"]
-        direction TB
-        D1["characters/\nmodels + schemas + service + router"]
-        D2["stories/\nmodels + schemas + service + router"]
-        D3["chapters/\nmodels + schemas + service + router"]
-    end
-    style Domain fill:#e3f2fd
-```
-
-`app/characters/`, `app/stories/`, etc. each contain their own
-`models.py` / `schemas.py` / `service.py` / `router.py`. Things that change
-together live together — a "characters" bug means opening one folder, not
-four.
-
-**Strict downward dependency order, with two deliberate exceptions.**
-
-```mermaid
-flowchart TD
-    generation --> chapters --> stories --> characters --> users
-    core["core/\n(security, ownership checks, status guard, LLM client)"]
-    core -.foundation for.-> generation & chapters & stories & characters & users
-    core == "exception:\nownership checks reach into\nStory/Character/Chapter models" ==> stories
-    chapters == "exception:\nreconstructing a chapter's body reaches\ninto generation's ChapterTurn model" ==> generation
-    style core fill:#fff3cd
-```
-
-Each domain may only import from domains *below* it. The two exceptions
-exist because the alternative — duplicating the same logic in every caller
-— was worse than bending the rule once, in one well-documented place.
-
-**UUID primary keys, not auto-increment.**
-
-```mermaid
-flowchart LR
-    Bad["/stories/42, /stories/43, ..."] -->|sequential, guessable| X["❌ enumerate other users' data"]
-    Good["/stories/e48d0167-3ec7-..."] -->|not guessable| Ok["✅"]
-    style X fill:#ffcdd2
-    style Ok fill:#c8e6c9
-```
-
-**No hard deletes — everything is archived.**
+**Story status transitions**
 
 ```mermaid
 stateDiagram-v2
-    [*] --> active
-    active --> archived: DELETE endpoint
-    archived --> [*]
-    note right of archived
-        the row stays in Postgres forever —
-        "deleted" just means filtered out of
-        every list/get query
-    end note
+    [*] --> draft
+    draft --> ongoing: Start story
+    draft --> abandoned: Abandon
+    ongoing --> on_hold: Pause
+    on_hold --> ongoing: Resume
+    ongoing --> completed: Finish story
+    ongoing --> abandoned: Abandon
+    completed --> ongoing: Reopen
+    abandoned --> ongoing: Reopen
 ```
 
-**A chapter's text has no `body` column — it's reconstructed on read.**
-
-```mermaid
-flowchart LR
-    T1["turn 1\n(accepted paragraph)"] --> J["\"\\n\\n\".join()\non every read"]
-    T2["turn 2"] --> J
-    T3["turn 3"] --> J
-    J --> Body["chapter body\n— never stored, always rebuilt"]
-```
-
-Each accepted paragraph needs its own `chapter_turns` row anyway (so the AI
-can later be told which instruction produced which paragraph) — a flat
-`body` column would just be a second representation to keep in sync.
-
-**Two separate cast tables, not one.**
-
-```mermaid
-flowchart LR
-    Story["a Story might have\n20 imported characters\n(story_characters)"] --> Chapter["this Chapter has\n3 active\n(chapter_characters)"]
-    Chapter --> Prompt["the generation prompt\nonly ever sees these 3"]
-```
-
-Collapsing these into one table would mean every scene's prompt includes
-the story's entire cast, blowing up the token budget and confusing the
-model about who's actually present.
-
-**Status transitions go through one shared choke point, not scattered
-`if` checks.**
-
-```mermaid
-flowchart TD
-    P1["PATCH /stories/id\nPATCH /chapters/id\n(generic field update)"] --> G["core/status.py\nassert_transition()"]
-    P2["set_chapter_status()\n— used by /complete, /lock,\n/unlock, accept, discard, generate"] --> G
-    G --> Allow["✅ allowed → applied"]
-    G --> Reject["🚫 409 rejected"]
-    style G fill:#fff3cd
-```
-
-A bare `PATCH status="complete"` used to silently bypass the summarization
-trigger entirely — both write paths now run through the same allow-list.
-
-**No migration tool.**
-
-```mermaid
-flowchart LR
-    Boot["app startup"] --> CA["Base.metadata.create_all()"]
-    CA --> New["✅ creates tables\nthat don't exist yet"]
-    CA -. does NOT .-> Alter["❌ alter columns on\nan already-live table"]
-    Alter --> Script["scripts/*.py —\nrun manually against\nthe live database"]
-    style Alter fill:#ffcdd2
-```
-
-Deliberate for a single-developer project; revisit if this ever needs
-versioned migrations against a shared production database.
-
-**Connection pool tuned for serverless Postgres.**
-
-```mermaid
-sequenceDiagram
-    participant App
-    participant Pool as SQLAlchemy Pool
-    participant Neon
-    Note over Pool,Neon: connection sits idle past Neon's timeout
-    Neon-->>Pool: silently drops it
-    App->>Pool: checkout
-    Pool-->>App: hands out a DEAD connection
-    App->>Neon: query
-    Neon--xApp: 💥 without pool_pre_ping, this 500s
-    Note over App,Neon: pool_pre_ping=True catches this transparently;<br/>pool_recycle=300 retires connections before they go stale
-```
-
-**Foreign-key columns are indexed on the hot paths.**
-
-```mermaid
-flowchart TD
-    Gen["POST /generate — the loop a writer\nrepeats dozens of times per chapter"]
-    Gen --> Q1["list_active_characters()"]
-    Gen --> Q2["list_relationships_among()"]
-    Gen --> Q3["get_prior_chapter_summaries()"]
-    Get["GET /chapters/id"] --> Q4["get_chapter_body()"]
-    Q1 --> T1["chapter_characters\n(served by its composite PK)"]
-    Q2 --> T2["character_relationships.character_id\n— now indexed"]
-    Q3 --> T3["chapters.story_id\n— now indexed"]
-    Q4 --> T4["chapter_turns.chapter_id\n— now indexed"]
-    style T2 fill:#c8e6c9
-    style T3 fill:#c8e6c9
-    style T4 fill:#c8e6c9
-```
-
-Postgres does not index foreign keys automatically — these were previously
-full table scans on every single generate/edit call, the core loop a
-writer repeats constantly.
-
-### From the frontend point of view
-
-**Client state mirrors server state; it doesn't own it.**
-
-```mermaid
-flowchart LR
-    Action["writer clicks Accept"] --> Call["await api.accept()"]
-    Call --> Server["backend response\nis the source of truth"]
-    Server --> Update["setState(result)"]
-    Stream["exception: mid-stream,\nthere's no server truth yet"] --> Local["append each delta\nto local state directly"]
-    style Stream fill:#fff3cd
-```
-
-Every mutating action calls the backend and updates local state from the
-result, so the client can't silently drift from what's actually in
-Redis/Postgres. The one deliberate exception is while a generation is
-streaming — there's nothing to mirror yet until the stream finishes.
-
-**One visual metaphor carries the whole writing room.**
+**Chapter status transitions**
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Pencil: draft streams in\n(distinct color, background wash)
-    Pencil --> Pencil: edit / regenerate
-    Pencil --> Ink: Accept — brief "ink-settling" transition
-    Pencil --> Gone: Discard
-    Ink --> [*]: permanent manuscript text
+    [*] --> draft
+    draft --> in_progress: Start writing
+    in_progress --> in_review: Draft ready
+    in_review --> in_progress: Keep, revise, or discard
+    in_review --> draft: Discard with no accepted prose
+    in_progress --> draft: Return to draft
+    in_progress --> complete: Complete with no pending draft
+    in_review --> complete: Complete with no pending draft
+    complete --> locked: Lock
+    locked --> complete: Unlock
+    complete --> in_progress: Edit accepted prose or continue writing
 ```
 
-Accepted text renders as typeset manuscript on a lit "paper" panel; a
-pending draft renders in a visually distinct "pencil" style — a
-provisional suggestion, not yet committed to the page.
+Archiving is separate from these status transitions. It hides a chapter from active lists while keeping its stored text.
 
----
+### Paragraph-by-paragraph writing
 
-## 6. Project folder structure
+Give the AI an instruction and choose a short, standard, or long response. Prose streams into the Galley as it is generated. Review the draft, then:
+
+- **Keep** it to add it to the accepted manuscript.
+- **Rewrite** it with another instruction.
+- **Edit** it manually and explicitly save your changes.
+- **Discard** it and continue experimenting.
 
 ```mermaid
 flowchart TD
-    Root["Story/"]
-    Root --> App["app/  — FastAPI backend"]
-    Root --> FE["frontend/  — React SPA"]
-    Root --> Scripts["scripts/  — one-off DB migration scripts"]
-    Root --> Tests["tests/  — smoke test"]
-
-    App --> Core["core/ — security, ownership checks,\nstatus state machine, LLM client,\nper-user rate limiting"]
-    App --> Auth["auth/ — signup, login, /me"]
-    App --> Users["users/ — User model only"]
-    App --> Characters["characters/ — character CRUD, relationships,\ncondensed_summary auto-generation"]
-    App --> Stories["stories/ — story bible CRUD, cast import"]
-    App --> Chapters["chapters/ — chapter CRUD, reorder,\nactive cast, lock/unlock"]
-    App --> Generation["generation/ — the writing loop"]
-
-    FE --> Lib["lib/ — API client, auth context, types"]
-    FE --> Components["components/ — nav shell, route guard"]
-    FE --> Features["features/ — one folder per screen"]
-    Features --> FAuth["auth/"]
-    Features --> FChar["characters/"]
-    Features --> FStory["stories/"]
-    Features --> FRoom["writing-room/"]
+    Instruction["Instruction, length, and optional scene"] --> Prepare["Check access and lock state; prepare context"]
+    Prepare --> Stream["Stream AI prose into the Galley"]
+    Stream --> Review["Review pending draft"]
+    Review --> Decision{"Writer decision"}
+    Decision -->|Rewrite| Rewrite["Give another instruction; preserve an alternate"]
+    Rewrite --> Prepare
+    Decision -->|Manual edit| Edit["Edit text and explicitly save the draft"]
+    Edit --> Review
+    Decision -->|Discard| Discard["Clear the pending draft"]
+    Discard --> Instruction
+    Decision -->|Keep| Check{"Draft and source versions current?"}
+    Check -->|No| Resolve["Reload, review, or regenerate"]
+    Resolve --> Review
+    Check -->|Yes| Commit["Atomically save accepted paragraph, revision, and jobs"]
+    Commit --> Cleanup["Attempt Redis draft cleanup"]
+    Cleanup --> Instruction
 ```
 
-```
-Story/
-├── app/
-│   ├── main.py              FastAPI() instance, router registration, table
-│   │                        creation on startup, CORS
-│   ├── config.py            Settings (env vars)
-│   ├── database.py          async engine/session, Base, uuid_pk()
-│   ├── core/
-│   │   ├── security.py      password hashing, JWT
-│   │   ├── deps.py          get_db, get_current_user, ownership checks,
-│   │   │                    rate_limited_user (RateLimitedUser)
-│   │   ├── status.py        shared status-transition guard
-│   │   ├── llm_client.py    OpenAI / Ollama dispatch, retry, streaming
-│   │   └── rate_limit.py    per-user token bucket, enforce_generation_rate_limit
-│   ├── auth/                router.py, schemas.py, service.py
-│   ├── users/                models.py only
-│   ├── characters/           models / schemas / service / router,
-│   │                         summarizer.py (condensed_summary background job)
-│   ├── stories/               models / schemas / service / router
-│   ├── chapters/               models / schemas / service / router
-│   └── generation/              models, schemas, session_store (optimistic
-│                                 locking), assembler, summarizer, service, router
-├── frontend/
-│   └── src/
-│       ├── lib/               apiFetch.ts, auth.tsx, types.ts
-│       ├── components/        AppShell.tsx, ProtectedRoute.tsx
-│       └── features/
-│           ├── auth/          LoginPage, SignupPage
-│           ├── characters/    CharactersPage + API
-│           ├── stories/       StoriesListPage, StoryDetailPage + API
-│           ├── chapters/      API only (managed from StoryDetailPage)
-│           └── writing-room/  WritingRoom.tsx + hooks + API
-├── scripts/
-│   └── migrate_optimizations.py   one-off ALTER TABLE / ALTER TYPE script
-└── tests/
-    └── test_smoke.py         full-flow test against a real Postgres
+Explicit Keep adds draft text to the manuscript. If Redis cleanup fails after the database commit, the accepted paragraph remains saved and a retry recovers its existing result.
+
+### Draft recovery and session conflicts
+
+Up to three alternate drafts remain available in the chapter session. Reloading can recover the current draft and its alternatives while the Redis session exists. Sessions expire after 48 hours; accepted writing remains in PostgreSQL.
+
+Draft acceptance uses a stable draft ID. Retrying after an interrupted response cannot add the same draft twice. If accepted text or chapter planning changes while a draft is pending, the app requires review before that draft can be accepted.
+
+```mermaid
+sequenceDiagram
+    actor Writer
+    participant UI as Galley
+    participant API as Backend
+    participant DB as PostgreSQL
+    participant Session as Redis
+    Writer->>UI: Open or reload chapter
+    UI->>API: Load chapter and draft session
+    API->>DB: Read owned chapter and accepted paragraphs
+    API->>Session: Read pending draft, alternatives, and session version
+    alt Session available
+        API->>DB: Check draft source revisions and accepted draft IDs
+        API-->>UI: Recover drafts, flag stale sources, and hide already accepted drafts
+    else Session missing or expired
+        API-->>UI: Accepted prose and an empty draft session
+    end
+    Writer->>UI: Edit a pending draft
+    UI->>API: Save draft with expected session version
+    API->>Session: Watch session and compare version
+    alt Version matches and transaction succeeds
+        API->>Session: Save new draft state and increment version
+        API-->>UI: Updated draft
+    else Session changed concurrently
+        API-->>UI: Conflict, reload before saving again
+    end
 ```
 
----
+The manuscript and draft session load separately. A lost or expired Redis session does not remove accepted paragraphs or their revision history.
 
-## 7. Backend folders, in detail
+### Accepted prose editing and history
 
-### `app/core/` — shared foundation
+Accepted paragraphs remain editable. **Edit · History** opens the paragraph editor and its immutable revision history. You can save a manual correction or restore an earlier revision; restoring creates a new revision rather than deleting intervening history.
+
+Version checks reject outdated edits from another tab or session. Editing a completed chapter reopens it, invalidates outdated AI memory, and schedules fresh summaries and embeddings. A locked chapter must be unlocked before its prose can change.
 
 ```mermaid
 flowchart TD
-    Sec["security.py\npassword hash, JWT encode/decode"]
-    Deps["deps.py\nCurrentUser, RateLimitedUser, get_owned_*"]
-    Status["status.py\nassert_transition"]
-    LLM["llm_client.py\ncall_model, stream_model"]
-    RateLimit["rate_limit.py\ntoken bucket per user"]
-    Sec --> Deps
-    RateLimit --> Deps
-    Every["every domain's router"] --> Deps
-    StoriesChapters["stories/, chapters/ services"] --> Status
-    Generation["generation/"] --> LLM
-    Summarizer["generation/summarizer.py,\ncharacters/summarizer.py"] --> LLM
+    Open["Open an accepted paragraph and its history"] --> Choice{"Change type"}
+    Choice -->|Edit| Edit["Write revised paragraph text"]
+    Choice -->|Restore| Restore["Select an earlier revision"]
+    Edit --> Submit["Submit with expected paragraph version"]
+    Restore --> Submit
+    Submit --> Check{"Owned, unlocked, valid, and current?"}
+    Check -->|No| Conflict["Show conflict or validation error; preserve manuscript"]
+    Conflict --> Reload["Load latest paragraph and review unsaved text"]
+    Reload --> Choice
+    Check -->|Yes| Changed{"Does the text change?"}
+    Changed -->|No| Noop["Return paragraph without another revision"]
+    Changed -->|Yes| Commit["Save new paragraph version, history, and memory jobs together"]
+    Commit --> Reopen["Reopen a completed chapter and show latest text"]
 ```
 
-- **`security.py`** — bcrypt password hashing, JWT create/decode.
-- **`deps.py`** — FastAPI dependencies: `CurrentUser` (decodes the bearer
-  token, loads the `User`), `RateLimitedUser` (wraps `CurrentUser` with
-  `rate_limit.enforce_generation_rate_limit` — a drop-in replacement used
-  only on `/generate` and `/generate/edit`), and `get_owned_story` /
-  `get_owned_character` / `get_owned_chapter` — the "does this belong to
-  you?" check, 404 rather than 403 so a non-owner can't even tell a
-  resource exists.
-- **`status.py`** — `assert_transition(current, new, allowed)`, the one
-  function every status-changing write path calls.
-- **`llm_client.py`** — the only file that talks to an LLM. `call_model()`
-  (one-shot, retried, used by background summarization) and
-  `stream_model()` (word-by-word, used by live generation). Both dispatch
-  to OpenAI or Ollama based on `settings.llm_provider`.
-- **`rate_limit.py`** — a per-user token bucket in Redis (burst 10 requests,
-  refilling at ~10/min sustained). `check_and_consume()` does the bucket
-  math; `enforce_generation_rate_limit()` is the dependency body that turns
-  an empty bucket into a `429` with `Retry-After`. Scoped by string (only
-  `"generate"` today) so other endpoints could get their own independent
-  budget later without new infrastructure.
+Restoring an earlier version creates a new history entry. Existing revisions remain available.
 
-### `app/auth/` — signup, login, "who am I"
+### Manuscript import and export
+
+Import UTF-8 `.txt` or `.md` files into an existing story. The import preview lets you inspect chapters, rename them, exclude chapters, and choose their order before committing. Imported chapters are appended to the story; its existing prose and bible are preserved.
+
+Parsing rules:
+
+- Blank lines separate paragraphs; line breaks within a paragraph remain.
+- Markdown uses `## Chapter title` headings, with an optional initial `# Story title`.
+- Plain text uses headings such as `Chapter 1: Arrival`, with an optional initial `Title: Story title`.
+- A file without recognized chapter headings becomes one imported chapter.
+- Markdown headings inside fenced code blocks are treated as content.
+
+Default bounds are 2,000,000 bytes, 100 chapters, and 2,000 paragraphs per import. An individual paragraph can contain up to 50,000 characters. Previews expire after 30 minutes. Optional AI enrichment can schedule summaries and embeddings after the import commits; enrichment failure does not remove imported writing.
+
+A committed import has a saved receipt. Retrying the same commit recovers its result without creating duplicate chapters. If the response is interrupted, the frontend preserves the commit options for recovery after reload.
+
+Export the accepted manuscript as `.txt` or `.md`, in chapter order. Archived chapters are excluded by default and can be included explicitly. Pending drafts and rewrite suggestions are excluded. These exports contain manuscript text, not the full database or revision history.
+
+```mermaid
+flowchart TD
+    Action{"Transfer action"}
+    Action -->|Import| Upload["Upload UTF-8 text or Markdown"]
+    Upload --> Parse["Validate bounds and parse chapters and paragraphs"]
+    Parse --> Preview["Preview; rename, exclude, and order chapters"]
+    Preview --> Request["Submit selected chapters and commit key"]
+    Request --> Receipt{"Matching saved receipt exists?"}
+    Receipt -->|Yes| Existing["Return the existing import result"]
+    Receipt -->|No| Valid{"Preview and options valid?"}
+    Valid -->|No| Correct["Correct options or upload again if expired"]
+    Correct --> Preview
+    Valid -->|Yes| Commit["Atomically append chapters, revisions, requested jobs, and receipt"]
+    Commit --> Imported["Imported manuscript available"]
+    Commit -.-> Enrich["Worker performs optional AI enrichment after commit"]
+    Action -->|Export| Scope["Choose text or Markdown and archived-chapter option"]
+    Scope --> Snapshot["Read accepted paragraphs in chapter order"]
+    Snapshot --> Format["Format title, chapter headings, and prose"]
+    Format --> Download["Download manuscript"]
+```
+
+A receipt prevents duplicate chapters when the same import is retried. Export reads accepted prose and leaves drafts and suggestions out of the downloaded manuscript.
+
+### Optional chapter and scene planning
+
+The **Planning** tab supports a chapter objective, conflict, ending beat, and notes. Add ordered scenes with a title, goal, conflict, outcome, setting, notes, cast, and an optional POV character. The POV character must belong to the selected scene cast.
+
+Planning is optional: write with no plan, a chapter plan alone, or detailed scenes. In the Galley, an optional scene selector supplies that scene's context and cast for the next generation. Without a selected scene, generation uses chapter context and its active cast.
+
+AI planning suggestions are editable proposals. They become saved plans only after the writer explicitly approves them. Planning changes do not alter accepted prose or turn intended events into established story facts.
+
+Accepted paragraphs retain their scene association. Removing a scene archives it and preserves existing paragraph links. Planning and scene edits use version checks to prevent overwriting newer changes.
+
+```mermaid
+flowchart TD
+    Use{"Use planning?"}
+    Use -->|No| Chapter["Use chapter context and active cast"]
+    Use -->|Yes| Method{"Planning method"}
+    Method -->|Manual| Manual["Write chapter plan and scene details"]
+    Method -->|AI suggestion| Suggest["Generate a validated planning proposal"]
+    Suggest --> Review["Review and edit the unsaved proposal"]
+    Review --> Approve{"Approve proposal?"}
+    Approve -->|No| Discard["Discard suggestion; saved planning stays unchanged"]
+    Discard --> Chapter
+    Approve -->|Yes| Versions{"Save versions valid and chapter unlocked?"}
+    Manual --> Versions
+    Versions -->|No| Conflict["Load latest planning or regenerate the suggestion"]
+    Conflict --> Method
+    Versions -->|Yes| Saved["Save chapter plan and ordered scenes"]
+    Saved --> Select{"Select a scene for generation?"}
+    Select -->|No| Chapter
+    Select -->|Yes| Scene["Use selected scene details, cast, and POV"]
+    Chapter --> Generate["Generate from current instruction and any saved planning"]
+    Scene --> Generate
+```
+
+Saved planning describes intended events. Accepted prose establishes what happened in the story. Choosing no scene still allows a saved chapter plan to guide generation.
+
+### Targeted AI rewriting
+
+Choose **AI rewrite** beneath an accepted paragraph. Use the whole paragraph or highlight a smaller range and choose **Use selected text**. Enter an instruction such as “make this more suspenseful while keeping the same events.”
+
+The app displays the original selection beside the AI suggestion. **Apply suggestion** replaces only that selection and records the change in revision history. **Cancel suggestion** leaves the manuscript unchanged. Closing the dialog keeps the saved suggestion available for later review, including after reload.
+
+Rewrite proposals use story context, relevant characters, nearby accepted prose, and optional planning. Applying rechecks the source paragraph, manuscript revision, original selection, and context fingerprint. Changed source material requires regeneration. Repeated application returns the saved receipt without another edit.
+
+Browser selections are converted from UTF-16 offsets to Unicode code-point offsets, so selections after emoji reach the backend correctly. Suggestions expire after 30 minutes. Selections are limited to 12,000 characters, instructions to 2,000, and replacements to 16,000; the resulting paragraph must remain within 50,000 characters.
+
+```mermaid
+sequenceDiagram
+    actor Writer
+    participant UI as Galley
+    participant API as Rewrite service
+    participant DB as PostgreSQL
+    participant AI as Configured model
+    Writer->>UI: Select paragraph text and enter an instruction
+    UI->>API: Generate with selection, source version, and proposal ID
+    API->>DB: Validate source and save generating proposal
+    Note over API,AI: Database transaction ends before inference
+    API->>AI: Send bounded context, selection, and instruction
+    AI-->>API: Return replacement text
+    API->>DB: Save validated suggestion
+    API-->>UI: Original selection and saved suggestion
+    Note over UI,DB: Closing or reloading can recover the saved proposal
+    alt Writer cancels
+        UI->>API: Cancel proposal
+        API->>DB: Mark proposal cancelled
+        API-->>UI: Manuscript unchanged
+    else Writer applies
+        UI->>API: Apply proposal
+        API->>DB: Lock and recheck proposal, paragraph, and context
+        alt Already applied
+            DB-->>API: Existing application receipt
+            API-->>UI: Receipt without another edit
+            UI->>API: Fetch current paragraph
+            API-->>UI: Latest manuscript text
+        else Source changed, expired, cancelled, or locked
+            API-->>UI: Reject and explain how to reload or regenerate
+        else Proposal is current and valid
+            API->>DB: Commit selected replacement, revision, jobs, and receipt together
+            API-->>UI: Application receipt
+            UI->>API: Fetch current paragraph
+            API-->>UI: Latest manuscript text
+        end
+    end
+```
+
+Invalid model output or provider failure marks generation failed and leaves accepted prose unchanged. Applying preserves all text outside the selected range.
+
+### AI memory and retrieval
+
+Accepted prose is the source of truth. Chapter summaries and paragraph embeddings are derived from specific content versions. Outdated summaries and vectors are excluded from generation context, and late AI results cannot overwrite memory for newer prose.
+
+Memory refresh and embedding work use durable PostgreSQL jobs with retries and leases. Interrupted work can be reclaimed, while obsolete jobs are marked accordingly. The Galley shows memory refresh status and offers retry when refresh fails. Character summaries use durable jobs when summary inputs change. Updates invalidate the previous summary; jobs release the database connection during inference and save only if their source fields still match.
+
+Semantic retrieval searches accepted paragraphs in other active chapters of the same story. It uses up to three passages with current embeddings and a cosine-distance relevance threshold. If query embedding fails, generation continues using the other available context.
+
+```mermaid
+flowchart TD
+    Change["Accepted manuscript text changes"] --> Atomic["Commit new content version; invalidate old memory; enqueue jobs"]
+    Refresh["Complete chapter or request memory refresh"] --> Queue["Queue job for current source version"]
+    Atomic --> Queue
+    Queue --> Claim["Worker claims an eligible job with a lease"]
+    Interrupted["Interrupted worker lease expires"] --> Claim
+    Claim --> Current{"Source version still current?"}
+    Current -->|No| Obsolete["Mark job obsolete"]
+    Current -->|Yes| Compute["Read source text; release DB connection; call AI provider"]
+    Compute --> Success{"Provider call succeeds?"}
+    Success -->|No| Budget{"Retry attempts remain?"}
+    Budget -->|Yes| Delay["Back off and queue again"]
+    Delay --> Queue
+    Budget -->|No| Failed["Mark failed; show refresh error"]
+    Failed --> Refresh
+    Success -->|Yes| Compare{"Conditional write still matches source version?"}
+    Compare -->|No| Obsolete
+    Compare -->|Yes| Saved["Save current summary or embedding; mark job done"]
+```
+
+The worker handles chapter memory, paragraph embedding, and character summary jobs. Provider failures leave accepted writing intact. Only results matching the current source version are saved.
+
+### Provider choice
+
+Configure OpenAI or local Ollama for prose generation, summaries, planning suggestions, and targeted rewrites. Manual editing, planning, and manuscript transfer remain usable without AI inference. Semantic embeddings currently use OpenAI even when prose generation uses Ollama; configuration details are listed below.
+
+## Typical workflow
+
+1. Sign up or log in.
+2. Create character sheets and a story bible.
+3. Import characters into the story, then create chapters or import an existing manuscript.
+4. Optionally plan a chapter and its scenes.
+5. Open the Galley, choose a scene if useful, and describe what happens next.
+6. Review each streamed draft and keep, rewrite, edit, or discard it.
+7. Refine accepted prose using manual editing or AI rewrite proposals.
+8. Mark the chapter complete and lock it when ready.
+9. Export the accepted manuscript when you want a portable text copy.
+
+Stories support draft, ongoing, on-hold, completed, and abandoned states. Chapters support draft, in-progress, in-review, complete, and locked states. Status transitions are checked by the backend; actions such as completion and locking use dedicated endpoints.
+
+## Tech stack
+
+### Frontend
+
+- React and TypeScript for application components and types.
+- Vite for local development and production builds.
+- React Router for navigation and TanStack Query for server data.
+- Tailwind CSS and Radix UI for styling and interface components.
+- Motion, Anime.js, and Three.js for transitions and animation.
+
+### Backend and data
+
+- Python and FastAPI for HTTP APIs and streamed responses.
+- Pydantic for request, settings, and structured AI-response validation.
+- Asynchronous SQLAlchemy and asyncpg for database access; Alembic for migrations.
+- PostgreSQL, with pgvector, for durable records and vector search; Neon is supported as a hosted database.
+- Redis for temporary writing sessions and rate-limit state.
+- PyJWT and bcrypt for bearer tokens and password hashing.
+- OpenAI and Ollama as AI provider integrations.
+
+## Architecture
+
+The browser sends authenticated requests to the API. Ownership and validation checks run before domain services act on stories, chapters, drafts, and proposals. Shared manuscript services coordinate accepted-text changes, history, and memory invalidation.
+
+PostgreSQL owns durable records: accepted paragraphs, revisions, story data, planning, import receipts, rewrite proposals, and jobs. Redis owns temporary generation drafts, alternate attempts, session versions, and inference rate-limit state. The worker claims durable jobs and writes AI-derived memory only if the source version still matches.
 
 ```mermaid
 flowchart LR
-    Router["router.py\nPOST /signup\nPOST /login\nGET /me"] --> Service["service.py\ncreate_user()\nauthenticate_user()"]
-    Service --> Sec["core/security.py\nhash_password, verify_password,\ncreate_access_token"]
-    Service --> UserModel["users/models.py\nUser"]
+    Browser["Browser application"] -->|Authenticated JSON requests| API["API: ownership and validation"]
+    API --> Writing["Writing and manuscript services"]
+    API --> Proposals["Planning and rewrite services"]
+    API --> Transfers["Import and export services"]
+    Writing -->|Durable text, revisions, and jobs| DB[("PostgreSQL")]
+    Proposals -->|Plans and rewrite proposals| DB
+    Transfers -->|Manuscript and import receipts| DB
+    Writing -->|Pending drafts and session versions| Session[("Redis")]
+    API -->|Inference rate-limit state| Session
+    Writing -->|Generate prose| AI["Configured prose and summary provider"]
+    Proposals -->|Generate suggestions| AI
+    Writing -.->|Optional query embedding| Embeddings["OpenAI embedding service"]
+    Writing -->|Streamed prose through API| Browser
+    Worker["Background worker"] -->|Claim jobs and conditionally save results| DB
+    Worker -->|Summarize accepted text| AI
+    Worker -->|Embed accepted paragraphs| Embeddings
 ```
 
-Thin router, password/token logic in `service.py`.
+JWT bearer tokens are stored in browser `localStorage` and attached by shared API helpers. Accepted manuscript text is reconstructed from ordered paragraph rows, so there is no separate chapter-body field to keep synchronized. Stories, chapters, characters, and scenes are archived while retaining their durable records.
 
-### `app/users/` — just the `User` model
+### Generation and performance
+
+The generation service prepares context before streaming starts. Story, cast, relationships, prior summaries, and chapter context share one short-lived read session. Semantic retrieval runs concurrently and opens its own read session only after its query embedding is available. The request database session closes before prose streaming begins.
+
+The system prompt contains the bible, cast, and relationships. The user prompt contains prior summaries, relevant retrieved prose, current chapter context, optional planning, and the writer's instruction.
 
 ```mermaid
 flowchart LR
-    UserModel["users/models.py\nUser"]
-    Auth["auth/"] --> UserModel
-    Characters["characters/"] --> UserModel
-    Stories["stories/"] --> UserModel
-    Deps["core/deps.py"] --> UserModel
+    Bible["Story bible"] --> System["System message"]
+    Cast["Selected scene cast or active chapter cast"] --> System
+    Cast --> Relationships["Relationships within that cast"]
+    Relationships --> System
+    Prior["Current summaries from prior chapters"] --> User["User message"]
+    Retrieved["Relevant accepted passages from other chapters"] --> User
+    Accepted["Current chapter context from durable accepted prose"] --> User
+    Planning["Optional chapter plan and selected scene"] --> User
+    Instruction["Writer instruction and requested length"] --> User
+    User --> Trim["Apply context-trimming order"]
+    System --> Model["Configured AI provider"]
+    Trim --> Model
 ```
 
-No router, no service — signup/login is a *workflow* that lives in `auth/`;
-every other domain just imports `User` for foreign keys.
+Fresh chapter memory requires only the last two accepted paragraphs. Without a usable current running summary, the fallback reads at most 32 recent paragraphs and supplies at most 24,000 characters of recent prose. Planning is treated as intended events, while accepted prose and current summaries supply established facts.
 
-### `app/characters/` — the cast
+When the user prompt exceeds its approximate budget, trimming removes older prior summaries first, then retrieved passages, the running summary, and the older raw-tail paragraph. Planning, the current instruction, and the length directive are preserved. Editing a pending draft preserves its text and edit instruction.
 
 ```mermaid
 flowchart TD
-    Router["router.py"] --> Service["service.py"]
-    Service --> Models["models.py\nCharacter, CharacterRelationship"]
-    Service --> Schemas["schemas.py"]
-    Service -- "BackgroundTasks,\nif a summary-relevant field changed" --> Summarizer["summarizer.py\nsummarize_character()"]
-    Summarizer --> LLM["core/llm_client.py\ncall_model"]
-    Summarizer --> Models
-    Chapters["chapters/service.py\ncreate_and_activate_character"] -.also schedules.-> Summarizer
-    Chapters -.list_active_characters.-> Models
-    Assembler["generation/assembler.py"] -.list_relationships_among.-> Service
-    Assembler -.reads condensed_summary.-> Models
+    Budget{"User prompt over approximate budget?"}
+    Budget -->|No| Send["Send system and user messages"]
+    Budget -->|Yes| Prior{"Older prior summaries remain?"}
+    Prior -->|Yes| DropPrior["Remove oldest prior summary"]
+    DropPrior --> Budget
+    Prior -->|No| Retrieved{"Retrieved passages remain?"}
+    Retrieved -->|Yes| DropRetrieved["Remove retrieved-passage block"]
+    DropRetrieved --> Budget
+    Retrieved -->|No| Summary{"Running summary remains?"}
+    Summary -->|Yes| DropSummary["Remove running summary"]
+    DropSummary --> Budget
+    Summary -->|No| Tail{"More than one raw-tail paragraph?"}
+    Tail -->|Yes| DropTail["Remove oldest raw-tail paragraph"]
+    DropTail --> Budget
+    Tail -->|No| Preserve["Keep latest prose, planning, instruction, and length directive"]
+    Preserve --> Send
 ```
 
-CRUD (`create` / `list` / `get` / `update` / `archive`) plus directional
-relationships between characters. `condensed_summary` — the short,
-prompt-ready version of a character sheet that `generation/assembler.py`
-puts into every system prompt — is generated automatically: `create_character`
-and `update_character` schedule `characters/summarizer.py`'s
-`summarize_character()` as a `BackgroundTasks` job (mirroring the
-`generation/summarizer.py` pattern — one `call_model` call, non-blocking).
-`update_character` only re-triggers it when a field that actually feeds the
-summary changed (`should_resummarize()` — appearance, voice notes,
-personality traits, motivation, flaw, backstory), so patching e.g. just
-`age` or `pronouns` doesn't cost a model call. `chapters/service.py`'s
-`create_and_activate_character` schedules the same job, since it builds a
-`Character` directly rather than going through this module's
-`create_character`.
+The approximate budget applies to the user message. Protected content can leave it above that target. Pending-draft editing preserves the draft and edit instruction without this trimming ladder.
 
-### `app/stories/` — the story bible
+The provider layer uses OpenAI chat completions or Ollama's native `/api/chat` endpoint. Non-streaming calls have bounded retries; live generation failures are surfaced through the event stream so the writer can decide what to do next. Planning and rewrite responses must pass structured validation before they become usable proposals.
 
-```mermaid
-flowchart TD
-    Router["router.py"] --> Service["service.py"]
-    Service --> Models["models.py\nStory, StoryCharacter,\nSTORY_TRANSITIONS"]
-    Service --> Guard["core/status.py\nassert_transition"]
-    Chapters["chapters/models.py"] --> Models
+The frontend loads feature pages lazily. The animated landing-page scene has its own Three.js bundle, and the production build checks that it remains isolated from the main application bundle.
+
+### Data integrity
+
+Every child-resource operation checks access through the writer's owned story or chapter. UUIDs identify resources; ownership checks enforce access.
+
+Paragraph and planning edits use expected versions. Redis session writes use optimistic concurrency. Durable acceptance, revision creation, and job scheduling happen together in PostgreSQL; a later Redis failure cannot undo an accepted paragraph. Rewrite application and its receipt also commit in one transaction.
+
+Generation, AI planning, and AI rewriting share a per-user inference rate limiter. Exhausted requests return `429` with `Retry-After`.
+
+## Project structure
+
+```text
+app/
+  auth/          Signup, login, and current-user endpoints
+  users/         User persistence
+  characters/    Character sheets, relationships, and summaries
+  stories/       Story bible and imported cast
+  chapters/      Chapter ordering, status, and active cast
+  generation/    Prompt assembly, streaming, drafts, and retrieval
+  manuscript/    Accepted prose editing, history, and versioned memory
+  planning/      Chapter plans, scenes, and AI planning proposals
+  rewriting/     Saved AI rewrite proposals and explicit application
+  transfers/     Manuscript parsing, previews, import, and export
+  jobs/          Durable memory and embedding jobs
+  core/          Authentication, ownership, rate limits, logging, and AI client
+  config.py      Environment settings
+  database.py    Database engine and session setup
+  main.py        Application startup, middleware, and routers
+
+frontend/
+  src/features/  Library, characters, chapters, Galley, planning, and transfers
+  src/components/ Shared UI components and application shells
+  src/hooks/     Streaming, keyboard, and animation hooks
+  src/lib/       API helpers, authentication, types, and shared utilities
+  src/styles/    Theme, layout, and manuscript styles
+  scripts/       Bundle isolation and Unicode selection checks
+
+scripts/         Database migration utilities and embedding backfills
 ```
 
-CRUD for the story itself, plus importing/removing characters
-(`story_characters`). `StoryDetailRead` is the one schema that returns a
-story with its imported characters nested inside.
+Backend domains generally contain their own models, schemas, service, and router. The writing features reuse the manuscript service for accepted-text changes so history and memory invalidation stay consistent.
 
-### `app/chapters/` — chapters, and the seam to `generation/`
-
-```mermaid
-flowchart TD
-    Router["router.py\n+ /reorder, /lock, /unlock,\n/characters/new"] --> Service["service.py"]
-    Service --> Models["models.py\nChapter, ChapterCharacter,\nCHAPTER_TRANSITIONS"]
-    Service --> Guard["core/status.py"]
-    Service -.ChapterTurn.-> GenModels["generation/models.py"]
-    GenService["generation/service.py"] --> Service
-```
-
-Owns the active-cast link table (`chapter_characters`), reordering,
-lock/unlock, and several small helpers the writing loop depends on:
-`list_active_characters`, `get_prior_chapter_summaries`,
-`update_chapter_summary`, `set_chapter_status`,
-`create_and_activate_character` (creates a new character *and* activates
-it in one transaction — "someone just walked into the scene"), and
-`get_chapter_body` (the turn-reconstruction helper).
-
-### `app/generation/` — the writing loop itself
-
-```mermaid
-flowchart TD
-    Router["router.py\nSSE endpoints"] --> Service["service.py"]
-    Service --> Prep["prepare_continue / prepare_edit\n(DB work, request's own session)"]
-    Service --> Gen["generate_continue / edit_pending\n(pure streaming, no DB)"]
-    Prep --> Assembler["assembler.py\nbuilds (system, user)"]
-    Gen --> LLMClient["core/llm_client.py"]
-    Service --> SessionStore["session_store.py\nRedis scratch pad"]
-    Service --> Summarizer["summarizer.py\ntwo background jobs"]
-    Summarizer --> LLMClient
-    Assembler --> Models["models.py\nChapterTurn"]
-```
-
-| File | Job |
-|---|---|
-| `models.py` | The one durable table, `chapter_turns` — one row per accepted paragraph. |
-| `schemas.py` | Request/response shapes for the writing-loop endpoints. |
-| `session_store.py` | Redis scratch pad for a chapter's in-progress draft. Writes are optimistic-locked (`WATCH`/`MULTI`/`EXEC` on a `version` field in the state blob) — a write against a stale version retries up to 5 times against a freshly-read state, then raises `SessionConflict` if the key is still genuinely contested. |
-| `assembler.py` | Builds the `(system, user)` prompt actually sent to the LLM, with priority-ordered budget trimming. |
-| `summarizer.py` | The two background summarization jobs. |
-| `service.py` | Orchestrates generate / edit / accept / discard / complete / status transitions. |
-| `router.py` | HTTP + SSE endpoints, nested under `/stories/{story_id}/chapters/{chapter_id}/...`. `/generate` and `/generate/edit` require `RateLimitedUser` instead of plain `CurrentUser`; `/accept` and `/discard` catch `SessionConflict` and turn it into a `409`. |
-
----
-
-## 8. Frontend folders, in detail
-
-### `src/lib/` — cross-cutting client code
-
-- **`apiFetch.ts`** — `apiFetch()` for normal JSON requests, `apiStream()`
-  for reading an SSE body. Both attach the bearer token and redirect to
-  `/login` on a 401.
-- **`auth.tsx`** — React context: current user, `login` / `signup` /
-  `logout`.
-- **`types.ts`** — TypeScript types mirroring the backend's Pydantic
-  schemas (hand-written, not generated).
-
-### `src/components/`
-
-- **`AppShell.tsx`** — top nav bar.
-- **`ProtectedRoute.tsx`** — redirects to `/login` if signed out.
-
-### `src/features/` — one folder per screen, each pairing a thin `*Api.ts`
-(one function per backend endpoint) with the page component(s) that use it:
-
-- **`auth/`** — login and signup pages.
-- **`characters/`** — roster page, full create form covering every backend
-  field.
-- **`stories/`** — list page; detail page with an editable story-bible
-  form, cast import picker, and chapter list/creation.
-- **`chapters/`** — API calls only; chapters are managed from
-  `StoryDetailPage` and written from `WritingRoom`, no dedicated chapter
-  page.
-- **`writing-room/`** — the flagship screen:
-  - `useChapterSession.ts` — the one hook holding the loop's state
-    (accepted paragraphs, pending draft, sibling attempts, status).
-  - `useDebouncedManualEdit.ts` — instant local typing, debounced
-    (600ms) write to the backend.
-  - `generationApi.ts` — the two streaming calls (`generate`,
-    `generateEdit`) take an `onDelta` callback instead of returning a
-    value, since the response is SSE, not JSON.
-  - `WritingRoom.tsx` — the page: manuscript + pending draft + sibling
-    attempts + compose bar + inline "add a character to this scene" +
-    click-to-rename chapter title.
-
----
-
-## 9. Getting started
-
-```mermaid
-flowchart LR
-    A["clone repo"] --> B["backend: venv + pip install"]
-    B --> C["configure .env\n(DB, Redis, LLM provider)"]
-    C --> D["uvicorn app.main:app --reload"]
-    D --> E["tables auto-created on boot\n(create_all — first run only)"]
-    E --> F["frontend: npm install"]
-    F --> G["configure .env\n(API base URL)"]
-    G --> H["npm run dev"]
-    H --> I["open localhost:5173,\nsign up, start writing"]
-```
+## Local setup
 
 ### Prerequisites
 
-- Python 3.11+ and Node 18+
-- A Postgres database — [Neon](https://neon.tech) (free tier works fine)
-  or any local Postgres
-- A reachable Redis instance
-- Either an OpenAI API key, **or** a local [Ollama](https://ollama.com)
-  install with a model already pulled (`ollama pull qwen3.6` or similar)
+- Python 3.11 or newer.
+- Node.js 24 is recommended for the frontend and its TypeScript selection tests.
+- PostgreSQL with pgvector support and a database URL.
+- Redis for chapter sessions and inference rate limits.
+- An OpenAI API key or a running Ollama server with a model available locally.
+- The project's Alembic configuration and revision files.
 
-### 1. Backend
+Database migration commands require `alembic.ini` and the `alembic/` revision directory. If either is missing, restore them before applying schema changes. Startup compares the database revision against the application’s required revision in `app/core/schema.py`; it does not load migration scripts or create or change tables automatically.
 
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-cp .env.example .env   # then fill in the values below
-.venv/bin/alembic upgrade head  # new empty database; existing DB: see phase/phase1.md
-.venv/bin/uvicorn app.main:app --reload
+### Startup and migration checks
+
+```mermaid
+flowchart TD
+    Install["Install dependencies and configure environment"] --> Files{"Migration configuration and revisions available?"}
+    Files -->|No| Restore["Restore required migration files"]
+    Restore --> Files
+    Files -->|Yes| New{"New empty database?"}
+    New -->|Yes| Initialize["Apply versioned migrations"]
+    New -->|No| Review["Back up data and verify current database revision"]
+    Review --> Upgrade["Apply the appropriate reviewed migrations"]
+    Initialize --> Boot["Start backend"]
+    Upgrade --> Boot
+    Boot --> Check{"Database at expected migration head?"}
+    Check -->|No| Blocked["Startup blocked; resolve migration mismatch"]
+    Blocked --> Review
+    Check -->|Yes| Worker["Start durable background worker and serve API"]
+    Worker --> Frontend["Start frontend and connect to API"]
+    Frontend --> Ready["Open the application"]
 ```
 
-Check it's up: `curl http://localhost:8000/health` → `{"status":"ok"}`.
-Interactive API docs at `http://localhost:8000/docs`.
+Startup checks the migration version before serving requests. Schema changes happen through explicit migrations, and existing data is preserved during reviewed upgrades.
 
-On a **brand-new** database, run `.venv/bin/alembic upgrade head` before
-starting the backend. For an existing database, follow the validated,
-backed-up migration workflow in [phase/phase1.md](phase/phase1.md). Startup
-checks the migration revision and does not change the schema. `scripts/migrate_optimizations.py` (run
-via `PYTHONPATH=. .venv/bin/python scripts/migrate_optimizations.py`) is
-only needed if you're pointing at a database that predates certain schema
-changes (new indexes, new status enum values) — safe to run regardless,
-every statement is idempotent.
+### Backend
 
-#### Backend environment variables (`.env`)
+From the repository root:
 
-| Variable | Required | Default | Notes |
-|---|---|---|---|
-| `DATABASE_URL` | yes | — | `postgresql+asyncpg://...` — Neon's **pooled** (`-pooler`) endpoint. Neon's dashboard gives you a `postgresql://...?sslmode=require&channel_binding=require` string — swap the scheme to `postgresql+asyncpg://` and drop the query params, `asyncpg` doesn't parse them like `libpq` does. |
-| `DATABASE_SSL_REQUIRE` | no | `true` | Set `false` only for local Postgres without SSL. |
-| `DB_POOL_SIZE` | no | `5` | Base SQLAlchemy pool size. Neon's per-role connection ceiling varies by plan — check your dashboard before raising this. |
-| `DB_MAX_OVERFLOW` | no | `5` | Extra connections allowed above `DB_POOL_SIZE` under burst load. |
-| `JWT_SECRET` | yes | — | Any long random string. |
-| `JWT_ALGORITHM` | no | `HS256` | |
-| `ACCESS_TOKEN_EXPIRE_MINUTES` | no | `60` | |
-| `REDIS_URL` | no | `redis://localhost:6379/0` | Needed for the writing loop's session store. |
-| `LLM_PROVIDER` | no | `openai` | `"openai"` or `"ollama"`. |
-| `OPENAI_API_KEY` | if provider is `openai` | — | |
-| `OPENAI_MODEL` | no | `gpt-4o-mini` | |
-| `OLLAMA_BASE_URL` | if provider is `ollama` | `http://localhost:11434` | The native API host — **not** `/v1`. |
-| `OLLAMA_MODEL` | if provider is `ollama` | `qwen3.6:latest` | Must already be pulled locally. |
+```bash
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
+```
 
-### 2. Frontend
+Edit `.env` with your database URL, JWT secret, Redis connection, and provider settings. Keep `.env` private.
+
+For a new empty database, once the migration files are available:
+
+```bash
+python -m alembic upgrade head
+```
+
+For an existing database, take a recoverable backup and use the migration utility appropriate to its current revision. Existing unversioned schemas require verification before any baseline stamp; do not stamp an unknown schema or reset its data to make startup pass.
+
+Start the API after migrations finish:
+
+```bash
+python -m uvicorn app.main:app --reload
+```
+
+The API runs at `http://localhost:8000`, with interactive API documentation at `http://localhost:8000/docs`. The backend starts its durable job worker as part of application startup.
+
+### Configuration
+
+Required backend settings:
+
+- `DATABASE_URL` — SQLAlchemy async PostgreSQL URL using the `postgresql+asyncpg://` scheme.
+- `JWT_SECRET` — secret used to sign access tokens.
+
+Other settings:
+
+- `DATABASE_SSL_REQUIRE` — defaults to `true`; set to `false` for a local database configured without SSL.
+- `DB_POOL_SIZE` and `DB_MAX_OVERFLOW` — both default to `5`.
+- `JWT_ALGORITHM` — defaults to `HS256`.
+- `ACCESS_TOKEN_EXPIRE_MINUTES` — defaults to `60`.
+- `REDIS_URL` — defaults to `redis://localhost:6379/0`.
+- `LLM_PROVIDER` — `openai` or `ollama`.
+- `OPENAI_API_KEY` and `OPENAI_MODEL` — OpenAI credentials and prose model; the default model is `gpt-4o-mini`.
+- `OLLAMA_BASE_URL` — defaults to `http://localhost:11434`, without a `/v1` suffix.
+- `OLLAMA_MODEL` — must match an installed model name. The supplied example uses `qwen3.8:27b-mlx`; choose a model available on your machine.
+- `IMPORT_MAX_BYTES`, `IMPORT_MAX_CHAPTERS`, `IMPORT_MAX_PARAGRAPHS`, and `IMPORT_PREVIEW_TTL_MINUTES` — import bounds and preview lifetime.
+- `ENVIRONMENT` — defaults to `dev`.
+- `LOG_LEVEL` — defaults to `INFO`; `DEBUG` includes database query timing.
+
+Settings are loaded from `.env` by `app/config.py`. The settings class defaults to OpenAI, while the supplied environment example selects Ollama.
+
+With Neon, use the pooled endpoint for normal application connections. Use the asyncpg URL scheme and configure SSL through `DATABASE_SSL_REQUIRE` rather than copying driver-specific query parameters from another PostgreSQL client.
+
+Ollama can provide prose, planning, rewrites, and summaries locally. Paragraph embeddings and semantic query embeddings still use OpenAI's `text-embedding-3-small` model. Without an OpenAI key, vector enrichment is unavailable; accepted text remains saved, and generation can continue without retrieved passages.
+
+### Frontend
+
+In a separate terminal:
 
 ```bash
 cd frontend
-npm install
-cp .env.example .env   # VITE_API_BASE_URL, defaults to http://localhost:8000
+npm ci
 npm run dev
 ```
 
-Open `http://localhost:5173`, sign up, and you're in.
+Open `http://localhost:5173`.
 
-### Troubleshooting
+The frontend uses `http://localhost:8000` as its default API URL. To change it, set `VITE_API_BASE_URL` in the frontend environment and restart Vite. Production builds need that value at build time.
 
-- **CORS errors in the browser console** — the backend's allow-list in
-  `app/main.py` only permits `localhost:5173`/`localhost:4173` by default;
-  if the frontend dev server picked a different port (check its startup
-  log), either free the expected port or extend the allow-list.
-- **`InvalidCatalogNameError` / connection refused on boot** — the
-  database in `DATABASE_URL` doesn't exist yet; create it first
-  (`createdb <name>` for local Postgres, or create the project in Neon).
-- **Generation requests hang or 502** — for `LLM_PROVIDER=ollama`, confirm
-  Ollama is actually running (`ollama list`) and the model in
-  `OLLAMA_MODEL` has been pulled.
+Development uses port `5173` and fails if it is already occupied. Production preview uses port `4173`. These localhost origins are allowed by the backend; using another origin requires updating its CORS configuration.
 
----
+## API overview
 
-## 10. Logging and observability
+All manuscript and planning actions are scoped to an owned story and chapter. The API documentation provides request schemas and complete endpoint details.
 
-```mermaid
-flowchart LR
-    Func["a decorated function\n(service layer, llm_client, assembler...)"] --> Dec["@log_execution"]
-    Dec --> Root["root logger"]
-    Route["every HTTP request"] --> MW["request-timing middleware\n(app/main.py)"]
-    MW --> Root
-    Root --> Stdout["StreamHandler → terminal\n(live while uvicorn runs)"]
-    Root --> File["RotatingFileHandler → logs/app.log\n(10MB × 5 backups)"]
-```
+- `/auth` — signup, login, and current user.
+- `/characters` — character sheets, archival, and relationships.
+- `/stories` — story bible, archival, and imported cast.
+- `/stories/{story_id}/chapters` — chapter creation, ordering, metadata, cast, and lock state.
+- Chapter `/generate` and `/generate/edit` — streamed generation and pending-draft revision.
+- Chapter `/session`, `/session/select`, `/manual-edit`, `/accept`, and `/discard` — draft recovery and decisions.
+- Chapter `/turns` — accepted paragraphs, versioned edits, revision history, and restoration.
+- Chapter `/memory-status` and `/memory-refresh` — memory status and refresh requests.
+- Chapter `/complete` and `/resummarize` — completion and summary refresh.
+- Story `/imports/preview`, `/imports/commit`, and `/export` — manuscript transfer.
+- Chapter `/plan`, `/scenes`, and `/plan-proposals/save`, plus story `/plan-suggestions` — optional planning.
+- Paragraph `/rewrite-proposals` — generate/list/recover suggestions, with `/{proposal_id}/apply` and `/{proposal_id}/cancel` for explicit decisions.
+- `/health` — basic API liveness response.
 
-Every function call, every HTTP request, and every prompt-caching-candidate
-read is logged with a start time, an elapsed duration in milliseconds, and —
-on failure — the exception type and message (never swallowed, always
-re-raised after logging). Logs go to **both** the terminal (while `uvicorn`
-is running) and `logs/app.log`, so they're visible live and still there
-afterward.
+## Development checks
 
-### Verbosity — `LOG_LEVEL`
-
-Set in `.env`, default `INFO`. At `INFO` you get one line per function call
-(start + done/failed) and one line per HTTP request. Set `LOG_LEVEL=DEBUG`
-to additionally see **per-query duration** from Postgres (via a SQLAlchemy
-cursor-execute event listener in `app/database.py`) — off by default since
-it's noisy; the SQL statement and its parameters are deliberately never
-logged, only how long each query took.
-
-### What the labels mean
-
-Greppable tags that show up in the log lines, so you can pull out exactly
-the signal you're after:
-
-| Label | Where | Meaning |
-|---|---|---|
-| `PREPARE_PHASE` | `generation/service.py` | The database-dependent setup for a generation call (fetching the story bible, active characters, prior summaries) — everything that has to finish *before* streaming can start. |
-| `GENERATE` / `EDIT` | `generation/service.py` | The streaming generation/edit call itself, end to end — includes the LLM round trip and the post-stream Redis/status bookkeeping. |
-| `LLM_STREAM` | `core/llm_client.py` | The raw provider call underneath `GENERATE`/`EDIT` — isolates actual model latency from the bookkeeping around it. |
-| `STREAM_TTFT` | any streamed function | Time-to-first-token — how long before the *first* chunk arrived. The number that actually determines how "responsive" generation feels. |
-| `STREAM_TOTAL` | any streamed function | Total duration once the stream is fully consumed, plus how many chunks it was made of. |
-| `CACHE_HIT` / `CACHE_MISS` | `generation/session_store.py` today; `# TODO` markers in `chapters/service.py` and `characters/service.py` for where a real cache layer would plug in next | Whether a lookup found something already there. Applied to Redis session reads now even though that's session state, not a cache — same read-or-miss shape, so the pattern is consistent once actual caching exists. |
-
-Example log line: `PREPARE_PHASE [app.generation.service.prepare_continue]
-START chapter_id='...' story_id='...' instruction=<redacted> length='short'`
-— followed by a `DONE 42.3ms` line once it finishes. Passwords, JWTs, and
-full prompt/completion text are never logged — sensitive parameters show as
-`<redacted>`, and anything that isn't a plain string/number/UUID shows only
-as its type name (e.g. `<AsyncSession>`), never a full object dump.
-
----
-
-## 11. Latency optimization decisions
-
-Full measurements, methodology, and per-endpoint before/after data live in
-[`LATENCY_OPTIMIZATION_REPORT.md`](./LATENCY_OPTIMIZATION_REPORT.md). Summary
-of what was done and why:
-
-- **Parallelized independent prompt-assembly reads** (`generation/assembler.py`)
-  — story, active characters, and prior-chapter summaries no longer wait on
-  each other; fetched concurrently via `asyncio.gather`.
-- **Overlapped the chapter status write with prompt assembly** instead of
-  running it first — the write now happens inside the same window as the
-  gather above instead of blocking in front of it.
-- **Cached chapter body reconstruction in Redis** (`session_store.py`) —
-  previously rebuilt from `chapter_turns` on every read; now cached and
-  explicitly invalidated on accept.
-- **Made the DB connection pool size configurable** (`DB_POOL_SIZE` /
-  `DB_MAX_OVERFLOW`) and added a connection-acquisition-time warning to
-  catch pool exhaustion under load.
-- **Collapsed ownership-check round trips into single joined queries** —
-  `get_owned_chapter` and `list_chapters` each used to fetch the parent
-  `Story` and the target row as two separate queries; now one `JOIN`.
-- **Stopped re-fetching a `Chapter` row already fetched by the router** —
-  the validated object is threaded through `prepare_continue`,
-  `prepare_edit`, `accept_pending`, `discard_pending`, `complete_chapter`,
-  `lock_chapter`, and `unlock_chapter` instead of being re-queried.
-- **Added a pool-contention vs. compute-cold-start diagnostic** — extends
-  the acquisition warning with pool-usage and idle-gap data, so a slow
-  request can be attributed to Neon's compute waking up vs. genuine
-  connection-pool pressure instead of guessing.
-- **Added `AbortController` cancellation to frontend data-fetching hooks**
-  — cuts wasted duplicate requests from React `StrictMode`'s dev-only
-  double-invoke; client-side benefit only, not a backend latency fix.
-
-### Result summary
-
-| Change | Measured impact |
-|---|---|
-| Parallel prompt-assembly reads | 2.61x faster (6358.6ms → 2431.9ms avg) |
-| Status write overlapped with assembly | ~855ms removed from the critical path |
-| Chapter body Redis cache | ~99.5% faster on cache hits (~580ms → ~3ms) |
-| `get_owned_chapter` join + re-fetch elimination | `/accept` −18.8% end-to-end; chapter-detail reads −23.6% |
-| `list_chapters` join collapse | Directionally faster; not yet statistically confirmed |
-| Connection pool sizing | No per-request speedup — capacity/reliability only |
-| Pool-contention diagnostic | Confirmed remaining latency is Neon compute cold-start, not app code |
-| Frontend `AbortController` cleanup | Dev-loop only — doesn't reduce backend load |
-
-**Bottom line**: every code-level optimization above is real and verified,
-but the app's dominant remaining latency is Neon's serverless compute
-waking from auto-suspend (1.5–3s per request after an idle gap) — confirmed
-by the diagnostic above, and not fixable in application code. See the full
-report for the reasoning and the two remaining options (a keep-alive ping,
-or a Neon plan/tier change).
-
-## Phase 2 — Manuscript import and export
-
-Open a story and use **Import manuscript** to preview a UTF-8 `.txt` or `.md` file. Rename, exclude, or reorder detected chapters, then import them as new chapters. Existing writing stays in place. Blank lines separate paragraphs; text chapter headings use `Chapter 1: Title`, and Markdown chapter headings use `## Title`. Optional AI memory refresh is off by default; importing itself requires no AI credentials.
-
-Use **Export manuscript** to download current accepted writing as text or Markdown. Pending drafts are excluded; archived chapters are optional. Defaults limit imports to 2,000,000 bytes, 100 chapters, and 2,000 paragraphs; previews expire after 30 minutes. Configure limits with `IMPORT_MAX_BYTES`, `IMPORT_MAX_CHAPTERS`, `IMPORT_MAX_PARAGRAPHS`, and `IMPORT_PREVIEW_TTL_MINUTES`.
-
-Install updated dependencies and apply the additive migration to an existing Phase 1 database before restarting:
+Backend regression checks (Redis concurrency checks start a disposable local Redis and require `redis-server`):
 
 ```bash
-venv/bin/python -m pip install -r requirements.txt
-PYTHONPATH=. venv/bin/python scripts/migrate_phase2.py
+venv/bin/python -m unittest discover -s tests -v
 ```
 
-The migration saves a private data snapshot and verifies every existing application table is unchanged. Use `venv/bin/alembic upgrade head` for a fresh database. See [phase/phase2.md](phase/phase2.md) for file changes, APIs, retry behavior, parsing rules, verification, and limits. DOCX support is deferred.
+The backend checks do not reset or write to the application database.
 
-## Phase 3 — Optional chapter and scene planning
-
-Use a story's **Planning** tab to save chapter objectives, conflict, ending beats, and notes, or add ordered scenes with goals, intended outcomes, setting, cast, and POV. Planning is optional: the Galley works without a plan or scene. Cast members must be active characters imported into the story.
-
-In the Galley, choose **Scene for next generation (optional)** to guide the next paragraph with that scene's plan and cast. Pending drafts keep their original scene; accepted paragraphs retain the association and display its name. With no scene selected, generation uses the existing chapter context and cast. Plans describe intended events; accepted prose and summaries describe actual events.
-
-**Suggest a plan** returns an editable proposal using your configured OpenAI/Ollama model. Suggestions do not save automatically. Review/edit it and choose **Save suggested plan and scenes** to save the approved chapter plan and append scenes. Manual planning needs no AI credentials; suggestions need the configured generation provider, but no embeddings.
-
-For an existing Phase 2 database, apply the migration before restarting:
+Available frontend checks:
 
 ```bash
-PYTHONPATH=. venv/bin/python scripts/migrate_phase3.py
+cd frontend
+npm run build
+npm run lint
+npm run test:rewriting
 ```
 
-The script takes a private data snapshot and checks every existing row is preserved before committing. Fresh databases use `venv/bin/alembic upgrade head`. See [phase/phase3.md](phase/phase3.md) for the file map, API contracts, verification, conflict handling, and limits.
+The build performs TypeScript checks and validates bundle isolation. The rewrite tests cover Unicode code-point offsets, emoji surrogate boundaries, combining marks, and invalid selection ranges.
 
-### Phase 4: targeted AI rewriting
+Database-dependent backend tests must run against an explicitly separate disposable database. Use isolated schemas and schema-qualified cleanup; never use the application database for test resets. A full backend regression run requires the repository's test suite and development dependencies to be present.
 
-In the Galley, choose **AI rewrite** beneath an accepted paragraph. Use the whole paragraph or highlight text and choose **Use selected text**, enter an instruction, and generate a suggestion. Compare the original and suggested text before choosing **Apply suggestion** or **Cancel suggestion**. Closing the dialog keeps the saved suggestion available for 30 minutes, including after reload.
+## Logging and troubleshooting
 
-Applying replaces only the selected range and records an **AI rewrite** in paragraph history. Changed paragraphs, neighboring manuscript, or rewrite context require regeneration; repeated Apply cannot duplicate an edit. Planning is optional, and ordinary manual editing continues to work without AI.
+The backend writes to stdout and `logs/app.log`, rotating at 10 MB with five backups. Request timing, operation timing, database connection diagnostics, and background-job failures help identify problems. Logs and private database snapshots should stay outside version control.
 
-For an existing Phase 3 database, run `PYTHONPATH=. venv/bin/python scripts/migrate_phase4.py` before starting the backend. The script takes a private table-data snapshot and verifies all existing rows remain unchanged. Current migration head: `0005_phase4`.
+Common issues:
 
-Verification commands: `STORY_TEST_POSTGRES=0 venv/bin/pytest -q` from the repository root, and `npm run build`, `npm run lint`, and `npm run test:rewriting` from `frontend/`. PostgreSQL tests require an explicitly separate `STORY_TEST_DATABASE_URL`; never point them at the application database.
+- **Missing migration configuration or migration-version mismatch:** restore the migration files and apply the appropriate migration before starting the API. The application deliberately refuses to start against an unexpected schema.
+- **Address already in use:** identify the existing process on the API or frontend port before starting another server.
+- **Failed to fetch:** check that the API is running, `VITE_API_BASE_URL` is correct, and the frontend origin is allowed by CORS.
+- **Ollama generation failure:** confirm that Ollama is running and that `OLLAMA_MODEL` matches a name returned by `ollama list`.
+- **Missing draft after a long break:** Redis sessions expire after 48 hours. Accepted manuscript text and revision history are stored separately in PostgreSQL.
+- **Edit or proposal conflict:** load the latest paragraph or plan, review the changes, and regenerate or retry with its current version.
+- **AI memory refresh failure:** check provider credentials and connectivity, then request another refresh. Accepted prose remains available while memory is stale.
+- **Import rejected:** check UTF-8 encoding, supported extension, file size, chapter/paragraph counts, and long paragraphs.
 
-See [phase/phase4.md](phase/phase4.md) for limits, files, API behavior, and rollout verification.
+## Current scope
+
+Imports and exports support plain text and Markdown. AI rewrites operate within one accepted paragraph. Chapter planning is optional. The app supplies continuity context through stored character facts, accepted prose, summaries, and retrieval; it does not currently provide an automated contradiction-review panel or guided story-setup wizard.

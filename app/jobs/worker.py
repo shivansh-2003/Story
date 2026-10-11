@@ -8,6 +8,7 @@ from app.database import async_session
 from app.generation.embedder import embed_turn
 from app.jobs.models import BackgroundJob
 from app.manuscript.memory import refresh_memory
+from app.characters.summarizer import summarize_character
 
 logger = logging.getLogger(__name__)
 MAX_ATTEMPTS = 3
@@ -78,6 +79,8 @@ async def run_one() -> bool:
             applied = await refresh_memory(job.target_id, job.target_revision)
         elif job.kind == "embedding":
             applied = await embed_turn(job.target_id, job.target_revision)
+        elif job.kind == "character_summary":
+            applied = await summarize_character(job.target_id, job.target_revision)
         else:
             raise ValueError("Unknown job type")
         values = {"status": "done" if applied else "obsolete", "error": None}

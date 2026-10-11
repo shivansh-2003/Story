@@ -3,8 +3,8 @@
 import re
 from pathlib import Path
 
-from fastapi import HTTPException
 
+from app.core.errors import DomainError
 from app.config import get_settings
 from app.transfers.schemas import PreviewChapter
 
@@ -16,19 +16,19 @@ def parse_manuscript(filename: str, data: bytes) -> list[PreviewChapter]:
     settings = get_settings()
     extension = Path(filename).suffix.lower()
     if extension not in {".txt", ".md"}:
-        raise HTTPException(
+        raise DomainError(
             415, "Choose a UTF-8 .txt or .md file. DOCX is not supported yet."
         )
     if len(data) > settings.import_max_bytes:
-        raise HTTPException(
+        raise DomainError(
             413, f"File exceeds the {settings.import_max_bytes:,}-byte import limit."
         )
     try:
         content = data.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
     except UnicodeDecodeError as error:
-        raise HTTPException(422, "File must be UTF-8 encoded.") from error
+        raise DomainError(422, "File must be UTF-8 encoded.") from error
     if any(ord(c) < 32 and c not in "\n\t" for c in content):
-        raise HTTPException(422, "File contains unsupported control characters.")
+        raise DomainError(422, "File contains unsupported control characters.")
 
     chapters: list[PreviewChapter] = []
     title = "Imported chapter"
@@ -83,18 +83,18 @@ def parse_manuscript(filename: str, data: bytes) -> list[PreviewChapter]:
             lines.append(line)
     finish()
     if not chapters or not any(c.paragraphs for c in chapters):
-        raise HTTPException(422, "The file has no manuscript paragraphs.")
+        raise DomainError(422, "The file has no manuscript paragraphs.")
     if len(chapters) > settings.import_max_chapters:
-        raise HTTPException(
+        raise DomainError(
             422, f"Import at most {settings.import_max_chapters} chapters at a time."
         )
     if sum(len(c.paragraphs) for c in chapters) > settings.import_max_paragraphs:
-        raise HTTPException(
+        raise DomainError(
             422,
             f"Import at most {settings.import_max_paragraphs} paragraphs at a time.",
         )
     if any(len(p) > 50000 for c in chapters for p in c.paragraphs):
-        raise HTTPException(
+        raise DomainError(
             422, "A paragraph exceeds 50,000 characters. Split it with a blank line."
         )
     return chapters

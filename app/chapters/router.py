@@ -1,13 +1,14 @@
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, status
+from fastapi import APIRouter, status
 
+from app.core.access import get_owned_chapter
 from app.chapters import service
 from app.chapters.models import Chapter
 from app.chapters.schemas import ChapterCreate, ChapterDetailRead, ChapterRead, ChapterReorderRequest, ChapterUpdate
 from app.characters.models import Character
 from app.characters.schemas import CharacterCreate, CharacterRead
-from app.core.deps import CurrentUser, DbSession, get_owned_chapter
+from app.core.deps import CurrentUser, DbSession
 from app.manuscript.service import list_turns
 from app.manuscript.schemas import TurnRead
 
@@ -66,10 +67,9 @@ async def create_and_activate_character(
     body: CharacterCreate,
     db: DbSession,
     current_user: CurrentUser,
-    background_tasks: BackgroundTasks,
 ) -> Character:
     return await service.create_and_activate_character(
-        db, current_user, story_id, chapter_id, body, background_tasks
+        db, current_user, story_id, chapter_id, body
     )
 
 

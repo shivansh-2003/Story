@@ -1,19 +1,18 @@
 import uuid
 
-from fastapi import BackgroundTasks, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import DomainError
+from app.core.access import get_owned_chapter, get_owned_character, get_owned_story
 from app.chapters.models import CHAPTER_TRANSITIONS, Chapter, ChapterCharacter, ChapterStatus
 from app.chapters.schemas import ChapterCreate, ChapterReorderRequest, ChapterUpdate
 from app.characters.models import Character
 from app.characters.schemas import CharacterCreate
-from app.characters.summarizer import summarize_character
-from app.core.deps import get_owned_chapter, get_owned_character, get_owned_story
+from app.characters.summarizer import schedule_summary
+
 from app.core.logging_utils import log_execution
 from app.core.status import assert_transition
-from app.generation import session_store
-from app.generation.models import ChapterTurn
 from app.stories.models import Story
 from app.users.models import User
 
@@ -39,7 +38,7 @@ async def list_chapters(db: AsyncSession, user: User, story_id: uuid.UUID) -> li
     )
     rows = result.all()
     if not rows or rows[0].user_id != user.id or rows[0].is_archived:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Story not found")
+        raise DomainError(404, "Story not found")
     return [row.Chapter for row in rows if row.Chapter is not None]
 
 
@@ -76,7 +75,7 @@ async def reorder_chapters(
     for item in body.items:
         chapter = chapters_by_id.get(item.chapter_id)
         if chapter is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Chapter not found")
+            raise DomainError(404, "Chapter not found")
         ordered.append((chapter, item.order_index))
 
     # uq_chapter_order_per_story isn't deferrable, so Postgres checks it per
@@ -96,19 +95,6 @@ async def reorder_chapters(
 
 
 @log_execution
-async def get_chapter_body(db: AsyncSession, chapter_id: uuid.UUID) -> str:
-    # Rebuilt from chapter_turns on every read but only changes when a turn
-    # is accepted, so it's cached in Redis and invalidated explicitly by
-    # accept_pending — not a TTL-only cache.
-    # Read durable text: revisioned edits must not be hidden by an old Redis body.
-    result = await db.execute(
-        select(ChapterTurn.content).where(ChapterTurn.chapter_id == chapter_id).order_by(ChapterTurn.sequence)
-    )
-    body = "\n\n".join(result.scalars().all())
-    return body
-
-
-@log_execution
 async def update_chapter(
     db: AsyncSession, user: User, story_id: uuid.UUID, chapter_id: uuid.UUID, body: ChapterUpdate
 ) -> Chapter:
@@ -118,8 +104,8 @@ async def update_chapter(
         new_status = fields["status"]
         if new_status in _PATCH_PROTECTED_STATUSES and new_status != chapter.status:
             endpoint = "complete" if new_status == ChapterStatus.complete else "lock"
-            raise HTTPException(
-                status.HTTP_409_CONFLICT, f"Use the /{endpoint} endpoint to transition to {new_status.value}"
+            raise DomainError(
+                409, f"Use the /{endpoint} endpoint to transition to {new_status.value}"
             )
         assert_transition(chapter.status, new_status, CHAPTER_TRANSITIONS)
     for field, value in fields.items():
@@ -159,7 +145,7 @@ async def remove_active_character(
 
     link = await db.get(ChapterCharacter, {"chapter_id": chapter_id, "character_id": character_id})
     if link is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Character not active in this chapter")
+        raise DomainError(404, "Character not active in this chapter")
 
     await db.delete(link)
     await db.commit()
@@ -172,7 +158,6 @@ async def create_and_activate_character(
     story_id: uuid.UUID,
     chapter_id: uuid.UUID,
     body: CharacterCreate,
-    background_tasks: BackgroundTasks,
 ) -> Character:
     """Create a character and mark it active in this chapter in one
     transaction — for "a new character just entered the scene," so the
@@ -184,31 +169,17 @@ async def create_and_activate_character(
     await db.flush()  # assign character.id before the link row needs it
 
     db.add(ChapterCharacter(chapter_id=chapter_id, character_id=character.id))
+    schedule_summary(db, character)
     await db.commit()
     await db.refresh(character)
-    background_tasks.add_task(summarize_character, character.id)
     return character
-
-
-@log_execution
-async def list_active_characters(db: AsyncSession, chapter_id: uuid.UUID) -> list[Character]:
-    # TODO: call log_cache_event here once a cache layer exists for this
-    # lookup — per the backend optimization plan, this is a caching
-    # candidate (queried on every prompt build within a chapter's writing
-    # session, changes only when the active cast is edited).
-    result = await db.execute(
-        select(Character)
-        .join(ChapterCharacter, ChapterCharacter.character_id == Character.id)
-        .where(ChapterCharacter.chapter_id == chapter_id)
-    )
-    return list(result.scalars().all())
 
 
 @log_execution
 async def get_prior_chapter_summaries(
     db: AsyncSession, story_id: uuid.UUID, before_chapter_id: uuid.UUID
 ) -> list[str]:
-    target_order = await db.scalar(select(Chapter.order_index).where(Chapter.id == before_chapter_id))
+    target_order = select(Chapter.order_index).where(Chapter.id == before_chapter_id).scalar_subquery()
     result = await db.execute(
         select(Chapter.chapter_summary)
         .where(
@@ -221,22 +192,6 @@ async def get_prior_chapter_summaries(
         .order_by(Chapter.order_index)
     )
     return list(result.scalars().all())
-
-
-@log_execution
-async def update_chapter_summary(
-    db: AsyncSession,
-    chapter_id: uuid.UUID,
-    *,
-    chapter_summary: str | None = None,
-    running_summary_cache: str | None = None,
-) -> None:
-    chapter = await db.get(Chapter, chapter_id)
-    if chapter_summary is not None:
-        chapter.chapter_summary = chapter_summary
-    if running_summary_cache is not None:
-        chapter.running_summary_cache = running_summary_cache
-    await db.commit()
 
 
 @log_execution

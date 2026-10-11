@@ -8,14 +8,15 @@ import asyncio
 
 from sqlalchemy import select
 
-from app.database import async_session
+from app.database import async_session, engine
+from app.core.llm_client import close_model_clients
 from app.generation.embedder import embed_turn
 from app.generation.models import ChapterTurn
 
 PROGRESS_EVERY = 20
 
 
-async def main() -> None:
+async def backfill() -> None:
     async with async_session() as db:
         result = await db.execute(select(ChapterTurn.id).where(ChapterTurn.embedding.is_(None)))
         turn_ids = list(result.scalars().all())
@@ -26,6 +27,14 @@ async def main() -> None:
         if (i + 1) % PROGRESS_EVERY == 0:
             print(f"  {i + 1}/{len(turn_ids)}")
     print("backfill complete")
+
+
+async def main() -> None:
+    try:
+        await backfill()
+    finally:
+        await close_model_clients()
+        await engine.dispose()
 
 
 if __name__ == "__main__":

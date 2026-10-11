@@ -1,9 +1,9 @@
 import uuid
 
-from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import DomainError
 from app.chapters.models import Chapter, ChapterStatus
 from app.generation.models import ChapterTurn
 from app.jobs.models import BackgroundJob
@@ -18,7 +18,7 @@ async def lock_chapter(db: AsyncSession, chapter: Chapter) -> Chapter:
         .execution_options(populate_existing=True)
     )
     if chapter.status == ChapterStatus.locked:
-        raise HTTPException(409, "Chapter is locked — unlock it before changing text.")
+        raise DomainError(409, "Chapter is locked — unlock it before changing text.")
     return chapter
 
 
@@ -31,7 +31,7 @@ async def get_turn(
         .execution_options(populate_existing=True)
     )
     if turn is None:
-        raise HTTPException(404, "Paragraph not found")
+        raise DomainError(404, "Paragraph not found")
     return turn
 
 
@@ -134,7 +134,7 @@ async def append_imported_paragraphs(
     return turns
 
 
-async def edit_turn(
+async def stage_turn_edit(
     db: AsyncSession,
     chapter: Chapter,
     turn_id: uuid.UUID,
@@ -144,12 +144,12 @@ async def edit_turn(
     revision_id: uuid.UUID | None = None,
     *,
     source: str = "user_edit",
-    commit: bool = True,
 ) -> ChapterTurn:
+    """Stage prose, history and derived jobs; the calling use case commits."""
     chapter = await lock_chapter(db, chapter)
     turn = await get_turn(db, chapter.id, turn_id)
     if turn.version != expected_version:
-        raise HTTPException(
+        raise DomainError(
             409,
             "This paragraph changed in another session. Reload it before saving; your edit has not been applied.",
         )
@@ -161,7 +161,7 @@ async def edit_turn(
             )
         )
         if revision is None:
-            raise HTTPException(404, "Revision not found")
+            raise DomainError(404, "Revision not found")
         content, restored_from = revision.content, revision.revision_number
     if content == turn.content:
         return turn
@@ -180,9 +180,16 @@ async def edit_turn(
     if chapter.status == ChapterStatus.complete:
         chapter.status = ChapterStatus.in_progress
     changed(db, chapter, turn)
-    if commit:
-        await db.commit()
-        await db.refresh(turn)
-    else:
-        await db.flush()
+    await db.flush()
+    return turn
+
+
+async def edit_turn(
+    db: AsyncSession, chapter: Chapter, turn_id: uuid.UUID, content: str | None,
+    expected_version: int, actor_id: uuid.UUID, revision_id: uuid.UUID | None = None,
+) -> ChapterTurn:
+    turn = await stage_turn_edit(db, chapter, turn_id, content, expected_version,
+                                 actor_id, revision_id)
+    await db.commit()
+    await db.refresh(turn)
     return turn

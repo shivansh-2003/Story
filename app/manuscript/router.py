@@ -3,8 +3,9 @@ import uuid
 from fastapi import APIRouter
 from sqlalchemy import or_, select
 
+from app.core.access import get_owned_chapter
 from app.chapters.models import Chapter
-from app.core.deps import CurrentUser, DbSession, RateLimitedUser, get_owned_chapter
+from app.core.deps import CurrentUser, DbSession, RateLimitedUser
 from app.generation.models import ChapterTurn
 from app.jobs.models import BackgroundJob
 from app.jobs.service import enqueue

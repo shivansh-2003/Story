@@ -1,10 +1,11 @@
 import uuid
 
-from fastapi import HTTPException
 from pydantic import ValidationError
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.characters.queries import scene_cast
+from app.core.errors import DomainError
 from app.chapters.models import Chapter
 from app.characters.models import Character
 from app.manuscript.service import lock_chapter
@@ -35,13 +36,14 @@ async def plan_read(db: AsyncSession, chapter: Chapter) -> PlanRead:
     )
 
 
-async def save_plan(
-    db: AsyncSession, chapter: Chapter, body: PlanUpdate, *, commit=True
+async def stage_plan(
+    db: AsyncSession, chapter: Chapter, body: PlanUpdate
 ) -> PlanRead:
+    """Stage a version-checked plan within the caller's transaction."""
     chapter = await lock_chapter(db, chapter)
     plan = await db.get(ChapterPlan, chapter.id, populate_existing=True)
     if body.expected_version != (plan.version if plan else 0):
-        raise HTTPException(
+        raise DomainError(
             409, "The chapter plan changed. Reload the latest plan before saving."
         )
     fields = body.model_dump(exclude={"expected_version"}, exclude_unset=True)
@@ -56,8 +58,6 @@ async def save_plan(
         plan.version += 1
     chapter.planning_revision += 1
     await db.flush()
-    if commit:
-        await db.commit()
     return await plan_read(db, chapter)
 
 
@@ -74,7 +74,7 @@ async def get_scene(
         .execution_options(populate_existing=True)
     )
     if scene is None or (scene.is_archived and not allow_archived):
-        raise HTTPException(404, "Scene not found in this chapter")
+        raise DomainError(404, "Scene not found in this chapter")
     return scene
 
 
@@ -97,7 +97,7 @@ async def validate_cast(
         ).all()
     )
     if found != set(ids):
-        raise HTTPException(
+        raise DomainError(
             422,
             "Every scene character must be an active character imported into this story.",
         )
@@ -144,9 +144,10 @@ async def scenes_read(db: AsyncSession, chapter: Chapter) -> list[SceneRead]:
     ]
 
 
-async def create_scene(
-    db: AsyncSession, chapter: Chapter, body: SceneFields, *, commit=True
+async def stage_scene(
+    db: AsyncSession, chapter: Chapter, body: SceneFields
 ) -> Scene:
+    """Stage scene and cast rows without committing a combined proposal early."""
     chapter = await lock_chapter(db, chapter)
     await validate_cast(db, chapter, body.character_ids)
     if (
@@ -157,7 +158,7 @@ async def create_scene(
         )
         >= 100
     ):
-        raise HTTPException(422, "A chapter can have at most 100 active scenes.")
+        raise DomainError(422, "A chapter can have at most 100 active scenes.")
     order = await db.scalar(
         select(func.coalesce(func.max(Scene.order_index), -1) + 1).where(
             Scene.chapter_id == chapter.id, Scene.is_archived.is_(False)
@@ -180,8 +181,6 @@ async def create_scene(
     )
     chapter.planning_revision += 1
     await db.flush()
-    if commit:
-        await db.commit()
     return scene
 
 
@@ -191,7 +190,7 @@ async def update_scene(
     chapter = await lock_chapter(db, chapter)
     scene = await get_scene(db, chapter.id, scene_id)
     if scene.version != body.expected_version:
-        raise HTTPException(
+        raise DomainError(
             409, "This scene changed. Reload the latest scene before saving."
         )
     current_cast = set(
@@ -213,7 +212,7 @@ async def update_scene(
     try:
         validated = SceneFields.model_validate(merged)
     except ValidationError as error:
-        raise HTTPException(
+        raise DomainError(
             422,
             "Invalid scene details. Use a nonblank title, valid text fields, and a POV included in the scene cast.",
         ) from error
@@ -243,7 +242,7 @@ async def archive_scene(
     chapter = await lock_chapter(db, chapter)
     scene = await get_scene(db, chapter.id, scene_id)
     if scene.version != expected_version:
-        raise HTTPException(409, "This scene changed. Reload it before removing it.")
+        raise DomainError(409, "This scene changed. Reload it before removing it.")
     smallest = await db.scalar(
         select(func.min(Scene.order_index)).where(Scene.chapter_id == chapter.id)
     )
@@ -259,7 +258,7 @@ async def reorder_scenes(
 ) -> None:
     chapter = await lock_chapter(db, chapter)
     if chapter.planning_revision != body.expected_planning_revision:
-        raise HTTPException(
+        raise DomainError(
             409, "Planning changed. Reload the scenes before reordering."
         )
     scenes = (
@@ -273,7 +272,7 @@ async def reorder_scenes(
     if len(set(body.scene_ids)) != len(body.scene_ids) or set(body.scene_ids) != set(
         by_id
     ):
-        raise HTTPException(
+        raise DomainError(
             422, "Reorder must include every active scene exactly once."
         )
     if all(by_id[id].order_index == i for i, id in enumerate(body.scene_ids)):
@@ -298,20 +297,19 @@ async def save_proposal(
         chapter.planning_revision != body.expected_planning_revision
         or chapter.manuscript_revision != body.expected_manuscript_revision
     ):
-        raise HTTPException(
+        raise DomainError(
             409,
             "The manuscript or planning changed after this suggestion. Reload before saving it.",
         )
-    await save_plan(
+    await stage_plan(
         db,
         chapter,
         PlanUpdate(
             expected_version=body.expected_plan_version, **body.plan.model_dump()
         ),
-        commit=False,
     )
     for scene in body.scenes:
-        await create_scene(db, chapter, scene, commit=False)
+        await stage_scene(db, chapter, scene)
     await db.commit()
     return await plan_read(db, chapter)
 
@@ -332,21 +330,7 @@ async def generation_context(
     characters = None
     if scene_id is not None:
         scene = await get_scene(db, chapter.id, scene_id)
-        characters = list(
-            (
-                await db.scalars(
-                    select(Character)
-                    .join(SceneCharacter, SceneCharacter.character_id == Character.id)
-                    .join(StoryCharacter, StoryCharacter.character_id == Character.id)
-                    .where(
-                        SceneCharacter.scene_id == scene.id,
-                        StoryCharacter.story_id == chapter.story_id,
-                        Character.is_archived.is_(False),
-                    )
-                    .order_by(Character.name, Character.id)
-                )
-            ).all()
-        )
+        characters = await scene_cast(db, chapter.story_id, scene.id)
         pov = next((c.name for c in characters if c.id == scene.pov_character_id), None)
         text += "\n\nSelected scene (intended events):\n" + "\n".join(
             f"{key}: {value}"
@@ -367,3 +351,15 @@ async def generation_context(
         "scene_id": str(scene_id) if scene_id else None,
         "planning_revision": chapter.planning_revision,
     }
+
+
+async def save_plan(db: AsyncSession, chapter: Chapter, body: PlanUpdate) -> PlanRead:
+    result = await stage_plan(db, chapter, body)
+    await db.commit()
+    return result
+
+
+async def create_scene(db: AsyncSession, chapter: Chapter, body: SceneFields) -> Scene:
+    scene = await stage_scene(db, chapter, body)
+    await db.commit()
+    return scene

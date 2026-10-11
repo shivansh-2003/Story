@@ -3,13 +3,14 @@ import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from fastapi import HTTPException
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import DomainError
+from app.core.access import get_owned_story
 from app.chapters.models import Chapter
 from app.config import get_settings
-from app.core.deps import get_owned_story
+
 from app.generation.models import ChapterTurn
 from app.manuscript.service import append_imported_paragraphs
 from app.stories.models import Story
@@ -41,7 +42,7 @@ async def create_preview(
         )
     )
     if active >= 10:
-        raise HTTPException(
+        raise DomainError(
             429, "Too many open import previews. Cancel one or wait for it to expire."
         )
     preview = ImportPreview(
@@ -76,7 +77,7 @@ async def commit_import(
         .execution_options(populate_existing=True)
     )
     if preview is None:
-        raise HTTPException(404, "Import preview not found")
+        raise DomainError(404, "Import preview not found")
     request_hash = hashlib.sha256(
         json.dumps(body.model_dump(mode="json"), sort_keys=True).encode()
     ).hexdigest()
@@ -85,26 +86,26 @@ async def commit_import(
             preview.commit_key != body.commit_key
             or preview.request_hash != request_hash
         ):
-            raise HTTPException(
+            raise DomainError(
                 409, "This preview was already imported with different options."
             )
         return ImportResult.model_validate(preview.result)
     if preview.expires_at.replace(tzinfo=UTC) <= datetime.now(UTC):
-        raise HTTPException(410, "Import preview expired. Upload the file again.")
+        raise DomainError(410, "Import preview expired. Upload the file again.")
     if await db.scalar(
         select(ImportPreview.id).where(
             ImportPreview.story_id == story_id,
             ImportPreview.commit_key == body.commit_key,
         )
     ):
-        raise HTTPException(
+        raise DomainError(
             409, "This import key was already used for another preview."
         )
     indices = [c.source_index for c in body.chapters]
     if len(set(indices)) != len(indices) or any(
         i >= len(preview.chapters) for i in indices
     ):
-        raise HTTPException(
+        raise DomainError(
             422, "Select each source chapter at most once using its preview index."
         )
     settings = get_settings()
@@ -113,7 +114,7 @@ async def commit_import(
         len(indices) > settings.import_max_chapters
         or not 0 < count <= settings.import_max_paragraphs
     ):
-        raise HTTPException(422, "Selection is empty or exceeds the import limits.")
+        raise DomainError(422, "Selection is empty or exceeds the import limits.")
     next_order = await db.scalar(
         select(func.coalesce(func.max(Chapter.order_index), -1) + 1).where(
             Chapter.story_id == story_id
@@ -193,7 +194,7 @@ async def read_export(
         )
     ).all()
     if not rows:
-        raise HTTPException(404, "Story not found")
+        raise DomainError(404, "Story not found")
     chapters = {}
     for row in rows:
         if row.id is not None:

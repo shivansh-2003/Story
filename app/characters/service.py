@@ -1,13 +1,13 @@
 import uuid
 
-from fastapi import BackgroundTasks
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.access import get_owned_character
 from app.characters.models import Character, CharacterRelationship
 from app.characters.schemas import CharacterCreate, CharacterRelationshipCreate, CharacterUpdate
-from app.characters.summarizer import should_resummarize, summarize_character
-from app.core.deps import get_owned_character
+from app.characters.summarizer import schedule_summary, should_resummarize
+
 from app.core.logging_utils import log_execution
 from app.users.models import User
 
@@ -22,34 +22,35 @@ async def list_characters(db: AsyncSession, user: User) -> list[Character]:
 
 @log_execution
 async def create_character(
-    db: AsyncSession, user: User, body: CharacterCreate, background_tasks: BackgroundTasks
+    db: AsyncSession, user: User, body: CharacterCreate
 ) -> Character:
-    character = Character(user_id=user.id, **body.model_dump())
+    character = Character(id=uuid.uuid4(), user_id=user.id, **body.model_dump())
     db.add(character)
+    schedule_summary(db, character)
     await db.commit()
     await db.refresh(character)
-    background_tasks.add_task(summarize_character, character.id)
     return character
 
 
 @log_execution
 async def update_character(
-    db: AsyncSession, user: User, character_id: uuid.UUID, body: CharacterUpdate, background_tasks: BackgroundTasks
+    db: AsyncSession, user: User, character_id: uuid.UUID, body: CharacterUpdate
 ) -> Character:
-    character = await get_owned_character(db, character_id, user)
-    fields = body.model_dump(exclude_unset=True)
+    character = await get_owned_character(db, character_id, user, for_update=True)
+    fields = {key: value for key, value in body.model_dump(exclude_unset=True).items()
+              if getattr(character, key) != value}
     for field, value in fields.items():
         setattr(character, field, value)
+    if should_resummarize(set(fields)):
+        schedule_summary(db, character)
     await db.commit()
     await db.refresh(character)
-    if should_resummarize(set(fields.keys())):
-        background_tasks.add_task(summarize_character, character.id)
     return character
 
 
 @log_execution
 async def archive_character(db: AsyncSession, user: User, character_id: uuid.UUID) -> None:
-    character = await get_owned_character(db, character_id, user)
+    character = await get_owned_character(db, character_id, user, for_update=True)
     character.is_archived = True
     await db.commit()
 
@@ -77,25 +78,3 @@ async def add_relationship(
     await db.commit()
     await db.refresh(relationship)
     return relationship
-
-
-@log_execution
-async def list_relationships_among(
-    db: AsyncSession, character_ids: list[uuid.UUID]
-) -> list[CharacterRelationship]:
-    """Relationships where both sides are in the given set — used by the
-    generation assembler to surface only relationships relevant to characters
-    actually active in the current chapter, not the writer's full cast."""
-    if not character_ids:
-        return []
-    # TODO: call log_cache_event here once a cache layer exists for this
-    # lookup — per the backend optimization plan, this is a caching
-    # candidate (same character set queried repeatedly within one chapter's
-    # writing session).
-    result = await db.execute(
-        select(CharacterRelationship).where(
-            CharacterRelationship.character_id.in_(character_ids),
-            CharacterRelationship.related_character_id.in_(character_ids),
-        )
-    )
-    return list(result.scalars().all())

@@ -1,7 +1,7 @@
 from enum import Enum
 
-from fastapi import HTTPException, status
 
+from app.core.errors import DomainError
 from app.core.logging_utils import log_execution
 
 
@@ -14,7 +14,7 @@ def assert_transition(current: Enum, new: Enum, allowed: dict) -> None:
     if current == new:
         return
     if new not in allowed.get(current, set()):
-        raise HTTPException(status.HTTP_409_CONFLICT, f"Cannot transition from {current.value} to {new.value}")
+        raise DomainError(409, f"Cannot transition from {current.value} to {new.value}")
 
 
 def _demo() -> None:
@@ -31,7 +31,7 @@ def _demo() -> None:
     raised = False
     try:
         assert_transition(Color.red, Color.blue, rules)
-    except HTTPException as e:
+    except DomainError as e:
         raised = True
         assert e.status_code == 409
     assert raised, "disallowed transition should have raised 409"

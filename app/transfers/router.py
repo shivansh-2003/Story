@@ -4,8 +4,9 @@ from typing import Literal
 from fastapi import APIRouter, UploadFile
 from fastapi.responses import Response
 
+from app.core.access import get_owned_story
 from app.config import get_settings
-from app.core.deps import CurrentUser, DbSession, get_owned_story
+from app.core.deps import CurrentUser, DbSession
 from app.transfers import service
 from app.transfers.exporters import download_filename, export_manuscript
 from app.transfers.schemas import ImportCommit, ImportResult, PreviewRead

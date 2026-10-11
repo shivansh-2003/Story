@@ -6,7 +6,7 @@ from functools import lru_cache
 from typing import TypeVar
 
 import httpx
-from openai import AsyncOpenAI
+from openai import APIConnectionError, APIStatusError, AsyncOpenAI
 from pydantic import BaseModel
 
 from app.config import get_settings
@@ -17,6 +17,8 @@ logger = logging.getLogger("story_assistant.llm")
 RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = (1, 2)  # sleep before attempt 2, before attempt 3
 JsonModel = TypeVar("JsonModel", bound=BaseModel)
+EMBEDDING_MODEL = "text-embedding-3-small"
+MODEL_DEADLINE_SECONDS = 180
 
 
 async def call_json_model(user: str, response_model: type[JsonModel], max_tokens: int, system: str) -> JsonModel:
@@ -35,12 +37,45 @@ async def call_json_model(user: str, response_model: type[JsonModel], max_tokens
 
 @lru_cache
 def _openai_client() -> AsyncOpenAI:
-    return AsyncOpenAI(api_key=get_settings().openai_api_key)
+    # Retries are owned here, rather than multiplied by SDK retries.
+    return AsyncOpenAI(api_key=get_settings().openai_api_key, timeout=120, max_retries=0)
 
 
 @lru_cache
 def _ollama_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=120)
+
+
+async def close_model_clients() -> None:
+    closers = []
+    if _openai_client.cache_info().currsize:
+        closers.append(_openai_client().close())
+        _openai_client.cache_clear()
+    if _ollama_client.cache_info().currsize:
+        closers.append(_ollama_client().aclose())
+        _ollama_client.cache_clear()
+    results = await asyncio.gather(*closers, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            logger.warning("AI client cleanup failed (%s)", type(result).__name__)
+
+
+def is_transient(error: Exception) -> bool:
+    if isinstance(error, (APIConnectionError, httpx.TransportError)):
+        return True
+    if isinstance(error, APIStatusError):
+        return error.status_code in (408, 429) or error.status_code >= 500
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code in (408, 429) or error.response.status_code >= 500
+    return False
+
+
+async def embed_text(text: str) -> list[float]:
+    async with asyncio.timeout(60):
+        response = await _openai_client().embeddings.create(
+            model=EMBEDDING_MODEL, input=text
+        )
+    return response.data[0].embedding
 
 
 def _messages(user: str, system: str | None) -> list[dict[str, str]]:
@@ -87,6 +122,11 @@ async def call_model(user: str, max_tokens: int, system: str | None = None) -> s
     that silently never lands leaves a permanent gap in story continuity —
     unlike live generation, which already surfaces failures visibly to the
     user via an SSE error frame and doesn't need this."""
+    async with asyncio.timeout(MODEL_DEADLINE_SECONDS):
+        return await _call_with_retries(user, max_tokens, system)
+
+
+async def _call_with_retries(user: str, max_tokens: int, system: str | None) -> str:
     provider = get_settings().llm_provider
     last_error: Exception = RuntimeError("call_model: no attempts made")
     for attempt in range(RETRY_ATTEMPTS):
@@ -97,6 +137,8 @@ async def call_model(user: str, max_tokens: int, system: str | None = None) -> s
                 return await _call_ollama(user, max_tokens, system)
             return await _call_openai(user, max_tokens, system)
         except Exception as e:
+            if not is_transient(e):
+                raise
             last_error = e
             logger.warning("call_model attempt %d/%d failed", attempt + 1, RETRY_ATTEMPTS, exc_info=True)
     raise last_error
@@ -137,18 +179,23 @@ async def _stream_openai(user: str, max_tokens: int, system: str | None) -> Asyn
         max_tokens=max_tokens,
         stream=True,
     )
-    async for chunk in stream:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            yield delta
+    try:
+        async for chunk in stream:
+            if chunk.choices:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
+    finally:
+        await stream.close()
 
 
-# not decorated itself — it's a synchronous 2-line dispatch that returns an
-# async generator without awaiting anything; @log_execution on a plain sync
-# function would time only that instant dispatch, not the actual streaming.
-# The real work — and the TTFT/total timing — happens in the two functions
-# it returns, which are decorated directly above.
-def stream_model(user: str, max_tokens: int, system: str | None = None) -> AsyncIterator[str]:
-    if get_settings().llm_provider == "ollama":
-        return _stream_ollama(user, max_tokens, system)
-    return _stream_openai(user, max_tokens, system)
+# Provider generators own their timing; this wrapper owns the deadline and
+# deterministic cleanup when a client disconnects or closes the stream.
+async def stream_model(user: str, max_tokens: int, system: str | None = None) -> AsyncIterator[str]:
+    stream = (_stream_ollama if get_settings().llm_provider == "ollama" else _stream_openai)(user, max_tokens, system)
+    try:
+        async with asyncio.timeout(MODEL_DEADLINE_SECONDS):
+            async for delta in stream:
+                yield delta
+    finally:
+        await stream.aclose()

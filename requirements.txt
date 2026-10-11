@@ -1,4 +1,4 @@
-fastapi
+fastapi>=0.143.0
 uvicorn[standard]
 sqlalchemy[asyncio]>=2.0
 asyncpg
@@ -13,3 +13,4 @@ pgvector
 
 alembic>=1.13
 python-multipart>=0.0.20
+anyio

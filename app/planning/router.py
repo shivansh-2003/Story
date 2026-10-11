@@ -2,13 +2,8 @@ import uuid
 
 from fastapi import APIRouter, Query
 
-from app.core.deps import (
-    CurrentUser,
-    DbSession,
-    RateLimitedUser,
-    get_owned_chapter,
-    get_owned_story,
-)
+from app.core.access import get_owned_chapter, get_owned_story
+from app.core.deps import CurrentUser, DbSession, RateLimitedUser
 from app.planning import service, suggestions
 from app.planning.schemas import (
     PlanRead,

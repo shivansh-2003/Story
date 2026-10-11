@@ -1,7 +1,7 @@
-from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import DomainError
 from app.chapters.models import Chapter
 from app.characters.models import Character
 from app.core.llm_client import call_json_model
@@ -84,7 +84,7 @@ async def suggest(
         ):
             raise ValueError("Proposal references unavailable story characters")
     except Exception as error:
-        raise HTTPException(
+        raise DomainError(
             502,
             "AI planning suggestion failed or returned an invalid proposal. Your saved plans are unchanged; try again or plan manually.",
         ) from error

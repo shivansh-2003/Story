@@ -2,11 +2,12 @@ import asyncio
 import logging
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 
-from fastapi import BackgroundTasks, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import DomainError
 from app.chapters.models import Chapter, ChapterStatus
 from app.chapters.service import set_chapter_status
 from app.core.llm_client import stream_model
@@ -27,24 +28,18 @@ LENGTH_PRESETS = {"short": 50, "standard": 100, "long": 150}
 LENGTH_TOKEN_CEILINGS = {"short": 120, "standard": 220, "long": 320}
 
 
-@log_execution(label="PREPARE_PHASE")
+@log_execution(label="GENERATION_PREPARE")
 async def prepare_continue(
     db: AsyncSession, chapter: Chapter, story_id: uuid.UUID, instruction: str, length: str,
     scene_id: uuid.UUID | None = None,
 ) -> tuple[str, str, dict]:
-    """DB-dependent prep for generate_continue — must run and finish before
-    the router returns its StreamingResponse. FastAPI tears down `Depends(get_db)`
-    as soon as the route handler returns, which for a streaming response happens
-    immediately, before the generator body has run at all — so no DB access
-    can happen inside the generator itself.
+    """Prepare and commit request-scoped work before streaming starts.
 
-    Takes the already-fetched Chapter (from the router's ownership check)
-    instead of a bare id, so the lock check and status write don't re-query
-    a row the caller already has.
-
-    Returns (system, user, state)."""
+    The request DB dependency has function scope. Streaming persistence uses
+    independent short sessions rather than holding the request connection.
+    """
     if chapter.status == ChapterStatus.locked:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Chapter is locked — unlock it before generating or editing.")
+        raise DomainError(409, "Chapter is locked — unlock it before generating or editing.")
     chapter_id = chapter.id
     state = await session_store.get_session(chapter_id)
     state["manuscript_revision"] = chapter.manuscript_revision
@@ -67,9 +62,10 @@ async def generate_continue(
 ) -> AsyncIterator[str]:
     max_tokens = LENGTH_TOKEN_CEILINGS.get(length, LENGTH_TOKEN_CEILINGS["standard"])
     chunks: list[str] = []
-    async for delta in stream_model(user, max_tokens=max_tokens, system=system):
-        chunks.append(delta)
-        yield delta
+    async with aclosing(stream_model(user, max_tokens=max_tokens, system=system)) as stream:
+        async for delta in stream:
+            chunks.append(delta)
+            yield delta
 
     if state["pending_turn"]:
         state["sibling_attempts"] = ([state["pending_turn"]] + state["sibling_attempts"])[:3]
@@ -78,7 +74,7 @@ async def generate_continue(
     await _mark_in_review(chapter_id)
 
 
-@log_execution(label="PREPARE_PHASE")
+@log_execution(label="GENERATION_PREPARE")
 async def prepare_edit(
     db: AsyncSession, chapter: Chapter, story_id: uuid.UUID, instruction: str
 ) -> tuple[str, str, dict]:
@@ -88,7 +84,7 @@ async def prepare_edit(
 
     Returns (system, user, state)."""
     if chapter.status == ChapterStatus.locked:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Chapter is locked — unlock it before generating or editing.")
+        raise DomainError(409, "Chapter is locked — unlock it before generating or editing.")
     chapter_id = chapter.id
     state = await session_store.get_session(chapter_id)
     state["manuscript_revision"] = chapter.manuscript_revision
@@ -112,9 +108,10 @@ async def edit_pending(
     # edits have no length preset of their own — "standard" is a reasonable
     # ceiling since an edit is a revision, not meant to grow the text much.
     chunks: list[str] = []
-    async for delta in stream_model(user, max_tokens=LENGTH_TOKEN_CEILINGS["standard"], system=system):
-        chunks.append(delta)
-        yield delta
+    async with aclosing(stream_model(user, max_tokens=LENGTH_TOKEN_CEILINGS["standard"], system=system)) as stream:
+        async for delta in stream:
+            chunks.append(delta)
+            yield delta
 
     state["sibling_attempts"] = ([state["pending_turn"]] + state["sibling_attempts"])[:3]
     state["pending_turn"] = {"content": "".join(chunks), "instruction": instruction, "source": "ai", "draft_id": str(uuid.uuid4()), "base_revision": state["manuscript_revision"], "scene_id": state.get("generation_scene_id"), "base_planning_revision": state.get("planning_revision", 0)}
@@ -125,7 +122,7 @@ async def edit_pending(
 @log_execution
 async def _mark_in_review(chapter_id: uuid.UUID) -> None:
     # runs after the streaming response has already sent its content, so the
-    # request's own db session (torn down when the router returned) can't be
+    # function-scoped request session has closed and cannot be
     # reused — same reason prepare_*/generator are split in the first place.
     # Best-effort: the draft is already safely in Redis regardless of whether
     # this bookkeeping write lands, and a stuck status self-heals on the next
@@ -139,9 +136,10 @@ async def _mark_in_review(chapter_id: uuid.UUID) -> None:
 
 @log_execution
 async def apply_manual_edit(chapter_id: uuid.UUID, new_content: str, revision: int = 0, expected_version: int | None = None,
-                            planning_revision: int = 0, detach_scene: bool = False) -> dict:
+                            planning_revision: int = 0, detach_scene: bool = False, *, state: dict | None = None) -> dict:
     """User hand-edits the pending draft directly — no model call."""
-    state = await session_store.get_session(chapter_id)
+    if state is None:
+        state = await session_store.get_session(chapter_id)
     if expected_version is not None and expected_version != state["version"]:
         raise session_store.SessionConflict(chapter_id)
     if not new_content.strip() or len(new_content) > 50000:
@@ -154,7 +152,7 @@ async def apply_manual_edit(chapter_id: uuid.UUID, new_content: str, revision: i
 
 
 @log_execution
-async def accept_pending(db: AsyncSession, chapter: Chapter, background_tasks: BackgroundTasks, draft_id: uuid.UUID | None = None, actor_id: uuid.UUID | None = None) -> dict:
+async def accept_pending(db: AsyncSession, chapter: Chapter, draft_id: uuid.UUID | None = None, actor_id: uuid.UUID | None = None) -> dict:
     chapter = await manuscript.lock_chapter(db, chapter)
     chapter_id = chapter.id
     if draft_id:
@@ -169,17 +167,17 @@ async def accept_pending(db: AsyncSession, chapter: Chapter, background_tasks: B
     instruction = state["pending_turn"]["instruction"]
     pending = state["pending_turn"]
     if draft_id and str(draft_id) != pending.get("draft_id"):
-        raise HTTPException(409, "The pending draft changed. Reload before accepting.")
+        raise DomainError(409, "The pending draft changed. Reload before accepting.")
     if pending.get("base_revision", chapter.manuscript_revision) != chapter.manuscript_revision:
-        raise HTTPException(409, "The manuscript changed after this draft was written. Review and save the draft, or regenerate it, before accepting.")
+        raise DomainError(409, "The manuscript changed after this draft was written. Review and save the draft, or regenerate it, before accepting.")
     if pending.get("base_planning_revision", 0) != chapter.planning_revision:
-        raise HTTPException(409, "Planning changed after this draft was written. Review and save it, or regenerate it, before accepting.")
+        raise DomainError(409, "Planning changed after this draft was written. Review and save it, or regenerate it, before accepting.")
     scene_id = pending.get("scene_id")
     if scene_id:
         try:
             scene_id = uuid.UUID(scene_id)
         except ValueError as error:
-            raise HTTPException(409, "The draft has an invalid scene reference. Review and save it again.") from error
+            raise DomainError(409, "The draft has an invalid scene reference. Review and save it again.") from error
         await planning.get_scene(db, chapter.id, scene_id)
     if not content.strip():
         raise ValueError("Cannot accept an empty paragraph")
@@ -198,9 +196,6 @@ async def accept_pending(db: AsyncSession, chapter: Chapter, background_tasks: B
     await db.refresh(turn)
 
     # Accepted context now lives in PostgreSQL; keep Redis bounded to draft state.
-    state["raw_tail"] = []
-    state["running_summary"] = ""
-    state["word_count_since_compaction"] = 0
     state["pending_turn"] = None
     state["sibling_attempts"] = []
     # Durable acceptance has succeeded. Redis failure cannot undo it or make a retry duplicate it.
@@ -225,7 +220,7 @@ async def discard_pending(db: AsyncSession, chapter: Chapter) -> None:
 
 
 @log_execution
-async def complete_chapter(db: AsyncSession, chapter: Chapter, background_tasks: BackgroundTasks) -> dict:
+async def complete_chapter(db: AsyncSession, chapter: Chapter) -> dict:
     chapter = await manuscript.lock_chapter(db, chapter)
     chapter_id = chapter.id
     state = await session_store.get_session(chapter_id)
@@ -240,3 +235,78 @@ async def complete_chapter(db: AsyncSession, chapter: Chapter, background_tasks:
     db.add(BackgroundJob(kind="memory", target_id=chapter.id, target_revision=chapter.manuscript_revision))
     await db.commit()
     return {"status": "complete", "summarizing": True}
+
+
+async def request_resummarize(db: AsyncSession, chapter: Chapter) -> dict:
+    db.add(BackgroundJob(kind="memory", target_id=chapter.id,
+                         target_revision=chapter.manuscript_revision))
+    await db.commit()
+    return {"summarizing": True}
+
+
+async def read_session(db: AsyncSession, chapter: Chapter) -> dict:
+    # Upgrade legacy Redis drafts lazily without discarding their contents.
+    for _ in range(3):
+        state = await session_store.get_session(chapter.id)
+        migrated = False
+        for draft in ([state["pending_turn"]] if state["pending_turn"] else []) + state["sibling_attempts"]:
+            if not draft.get("draft_id"):
+                draft["draft_id"] = str(uuid.uuid4())
+                # Revision zero is the only safe basis for pre-versioning drafts.
+                draft["base_revision"] = 0
+                migrated = True
+        if not migrated:
+            break
+        try:
+            await session_store.save_session(chapter.id, state)
+            break
+        except session_store.SessionConflict:
+            continue
+    else:
+        raise DomainError(409, "The draft changed in another session. Reload first.")
+    # Hide already-accepted drafts after a Redis cleanup failure.
+    accepted_ids = {str(value) for value in (await db.scalars(select(ChapterTurn.accepted_draft_id).where(ChapterTurn.chapter_id == chapter.id, ChapterTurn.accepted_draft_id.is_not(None)))).all()}
+    pending = state["pending_turn"]
+    if pending and pending.get("draft_id") in accepted_ids:
+        pending = None
+    return {"pending_turn": pending, "sibling_attempts": [t for t in state["sibling_attempts"] if t.get("draft_id") not in accepted_ids], "version": state["version"], "manuscript_revision": chapter.manuscript_revision,
+            "planning_revision": chapter.planning_revision,
+            "stale_draft": bool(pending and (pending.get("base_revision", chapter.manuscript_revision) != chapter.manuscript_revision or pending.get("base_planning_revision", 0) != chapter.planning_revision))}
+
+
+async def select_attempt(db: AsyncSession, chapter: Chapter, body) -> dict:
+    chapter = await manuscript.lock_chapter(db, chapter)
+    state = await session_store.get_session(chapter.id)
+    if state["version"] != body.expected_version:
+        raise DomainError(409, "The draft changed in another session. Reload first.")
+    selected = next((t for t in state["sibling_attempts"] if t.get("draft_id") == str(body.draft_id)), None)
+    if selected is None:
+        raise DomainError(404, "Attempt not found")
+    attempts = [t for t in state["sibling_attempts"] if t is not selected]
+    if state["pending_turn"]:
+        attempts.insert(0, state["pending_turn"])
+    state["pending_turn"], state["sibling_attempts"] = selected, attempts[:3]
+    try:
+        await session_store.save_session(chapter.id, state)
+    except session_store.SessionConflict:
+        raise DomainError(409, "The draft changed in another session. Reload first.")
+    return {"selected": True}
+
+
+async def save_manual_draft(db: AsyncSession, chapter: Chapter, body) -> dict:
+    chapter = await manuscript.lock_chapter(db, chapter)
+    state = await session_store.get_session(chapter.id)
+    scene_id = (state["pending_turn"] or {}).get("scene_id")
+    detach_scene = False
+    if scene_id:
+        try:
+            await planning.get_scene(db, chapter.id, uuid.UUID(scene_id))
+        except (DomainError, ValueError):
+            detach_scene = True
+    try:
+        return await apply_manual_edit(chapter.id, body.content, chapter.manuscript_revision, body.expected_version,
+                                               chapter.planning_revision, detach_scene, state=state)
+    except ValueError as error:
+        raise DomainError(400, str(error))
+    except session_store.SessionConflict:
+        raise DomainError(409, "The draft changed in another session. Reload first.")

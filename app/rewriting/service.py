@@ -1,9 +1,9 @@
 from datetime import UTC, datetime, timedelta
 
-from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
+from app.core.errors import DomainError
 from app.chapters.models import Chapter, ChapterStatus
 from app.manuscript import service as manuscript
 from app.rewriting import suggestions
@@ -38,7 +38,7 @@ async def lock_source(db, chapter, user_id):
         .execution_options(populate_existing=True)
     )
     if chapter.is_archived or story.is_archived or story.user_id != user_id:
-        raise HTTPException(404, "Chapter not found")
+        raise DomainError(404, "Chapter not found")
     return chapter
 
 
@@ -57,7 +57,7 @@ async def get_proposal(db, chapter, turn_id, proposal_id, user_id, *, lock=False
         query = query.with_for_update()
     proposal = await db.scalar(query)
     if proposal is None:
-        raise HTTPException(404, "Rewrite proposal not found")
+        raise DomainError(404, "Rewrite proposal not found")
     return proposal
 
 
@@ -86,7 +86,7 @@ async def generate(db, chapter, turn_id, user_id, body):
     existing = await db.get(RewriteProposal, body.proposal_id)
     if existing is not None:
         if existing.user_id != user_id or existing.turn_id != turn_id:
-            raise HTTPException(404, "Rewrite proposal not found")
+            raise DomainError(404, "Rewrite proposal not found")
         if (
             any(
                 getattr(existing, key) != getattr(body, key)
@@ -94,27 +94,27 @@ async def generate(db, chapter, turn_id, user_id, body):
             )
             or existing.base_turn_version != body.expected_version
         ):
-            raise HTTPException(409, "This proposal ID belongs to a different request.")
+            raise DomainError(409, "This proposal ID belongs to a different request.")
         if existing.status == "applied":
             return ProposalRead.model_validate(existing)
         if expired(existing) or existing.status == "cancelled":
-            raise HTTPException(
+            raise DomainError(
                 410, "This proposal is no longer available. Generate a new suggestion."
             )
         if existing.status == "ready":
             return ProposalRead.model_validate(existing)
-        raise HTTPException(
+        raise DomainError(
             409,
             "Suggestion is still generating or failed. Check saved proposals, or generate a new suggestion.",
         )
     if chapter.status == ChapterStatus.locked:
-        raise HTTPException(409, "Unlock this chapter before rewriting text.")
+        raise DomainError(409, "Unlock this chapter before rewriting text.")
     if (
         turn.version != body.expected_version
         or body.end > len(turn.content)
         or turn.content[body.start : body.end] != body.original_text
     ):
-        raise HTTPException(
+        raise DomainError(
             409, "The selected paragraph changed. Reload it and select the text again."
         )
     count = await db.scalar(
@@ -127,7 +127,7 @@ async def generate(db, chapter, turn_id, user_id, body):
         )
     )
     if count >= 20:
-        raise HTTPException(
+        raise DomainError(
             429,
             "You have 20 active rewrite proposals. Cancel unused suggestions or wait for expiry.",
         )
@@ -153,7 +153,7 @@ async def generate(db, chapter, turn_id, user_id, body):
         await db.commit()
     except IntegrityError as error:
         await db.rollback()
-        raise HTTPException(
+        raise DomainError(
             409,
             "This proposal request is already being processed. Check saved proposals.",
         ) from error
@@ -172,7 +172,7 @@ async def generate(db, chapter, turn_id, user_id, body):
         if proposal.status == "generating":
             proposal.status = "failed"
             await db.commit()
-        raise HTTPException(
+        raise DomainError(
             502,
             "AI rewrite failed or returned invalid text. Your manuscript is unchanged. Try again.",
         ) from error
@@ -183,7 +183,7 @@ async def generate(db, chapter, turn_id, user_id, body):
         .execution_options(populate_existing=True)
     )
     if proposal.status != "generating" or expired(proposal):
-        raise HTTPException(
+        raise DomainError(
             410, "This proposal was cancelled or expired. Your manuscript is unchanged."
         )
     proposal.proposed_text = output.proposed_text
@@ -204,20 +204,20 @@ async def apply(db, chapter, turn_id, proposal_id, user_id):
             already_applied=True,
         )
     if expired(proposal) or proposal.status == "cancelled":
-        raise HTTPException(
+        raise DomainError(
             410, "Proposal expired or was cancelled. Generate a new suggestion."
         )
     if proposal.status != "ready":
-        raise HTTPException(409, "Proposal is not ready to apply.")
+        raise DomainError(409, "Proposal is not ready to apply.")
     if chapter.status == ChapterStatus.locked:
-        raise HTTPException(409, "Unlock this chapter before applying a rewrite.")
+        raise DomainError(409, "Unlock this chapter before applying a rewrite.")
     turn = await manuscript.get_turn(db, chapter.id, turn_id)
     if (
         turn.version != proposal.base_turn_version
         or chapter.manuscript_revision != proposal.base_manuscript_revision
         or turn.content[proposal.start : proposal.end] != proposal.original_text
     ):
-        raise HTTPException(
+        raise DomainError(
             409,
             "The manuscript changed after this suggestion. Reload and regenerate it.",
         )
@@ -225,7 +225,7 @@ async def apply(db, chapter, turn_id, proposal_id, user_id):
         db, chapter, turn, proposal.start, proposal.end
     )
     if fingerprint != proposal.context_version:
-        raise HTTPException(
+        raise DomainError(
             409, "Story, cast, or planning context changed. Regenerate this suggestion."
         )
     replacement = (
@@ -234,11 +234,11 @@ async def apply(db, chapter, turn_id, proposal_id, user_id):
         + turn.content[proposal.end :]
     )
     if not replacement.strip() or len(replacement) > 50000:
-        raise HTTPException(
+        raise DomainError(
             422,
             "The resulting paragraph must contain text and be at most 50000 characters.",
         )
-    turn = await manuscript.edit_turn(
+    turn = await manuscript.stage_turn_edit(
         db,
         chapter,
         turn_id,
@@ -246,7 +246,6 @@ async def apply(db, chapter, turn_id, proposal_id, user_id):
         proposal.base_turn_version,
         user_id,
         source="ai_rewrite",
-        commit=False,
     )
     proposal.status = "applied"
     proposal.applied_version, proposal.applied_content = turn.version, turn.content
@@ -263,7 +262,7 @@ async def cancel(db, chapter, turn_id, proposal_id, user_id):
     chapter = await lock_source(db, chapter, user_id)
     proposal = await get_proposal(db, chapter, turn_id, proposal_id, user_id, lock=True)
     if proposal.status == "applied":
-        raise HTTPException(
+        raise DomainError(
             409,
             "This rewrite is already applied. Use paragraph history to restore earlier text.",
         )

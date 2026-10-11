@@ -2,7 +2,8 @@ import uuid
 
 from fastapi import APIRouter
 
-from app.core.deps import CurrentUser, DbSession, RateLimitedUser, get_owned_chapter
+from app.core.access import get_owned_chapter
+from app.core.deps import CurrentUser, DbSession, RateLimitedUser
 from app.rewriting import service
 from app.rewriting.schemas import ApplyRead, ProposalRead, RewriteRequest
 

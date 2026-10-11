@@ -1,11 +1,12 @@
 import uuid
 
-from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import DomainError
+from app.core.access import get_owned_character, get_owned_story
 from app.characters.models import Character
-from app.core.deps import get_owned_character, get_owned_story
+
 from app.core.logging_utils import log_execution
 from app.core.status import assert_transition
 from app.stories.models import STORY_TRANSITIONS, Story, StoryCharacter
@@ -79,7 +80,7 @@ async def remove_character(db: AsyncSession, user: User, story_id: uuid.UUID, ch
 
     link = await db.get(StoryCharacter, {"story_id": story_id, "character_id": character_id})
     if link is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Character not imported into this story")
+        raise DomainError(404, "Character not imported into this story")
 
     await db.delete(link)
     await db.commit()

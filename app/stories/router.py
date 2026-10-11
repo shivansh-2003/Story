@@ -2,7 +2,8 @@ import uuid
 
 from fastapi import APIRouter, status
 
-from app.core.deps import CurrentUser, DbSession, get_owned_story
+from app.core.access import get_owned_story
+from app.core.deps import CurrentUser, DbSession
 from app.stories import service
 from app.stories.models import Story
 from app.stories.schemas import StoryCreate, StoryDetailRead, StoryRead, StoryUpdate

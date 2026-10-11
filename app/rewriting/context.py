@@ -3,10 +3,11 @@ import json
 
 from sqlalchemy import select
 
-from app.characters.models import Character, CharacterRelationship
+from app.characters.queries import chapter_cast, scene_cast, cast_relationships
+from app.core.errors import DomainError
 from app.generation.models import ChapterTurn
 from app.planning.service import generation_context
-from app.stories.models import Story, StoryCharacter
+from app.stories.models import Story
 
 
 async def capture_context(db, chapter, turn, start, end):
@@ -16,7 +17,7 @@ async def capture_context(db, chapter, turn, start, end):
         .execution_options(populate_existing=True)
     )
     # Accepted paragraphs retain links to archived scenes; those remain useful context.
-    from app.planning.models import Scene, SceneCharacter
+    from app.planning.models import Scene
 
     scene = await db.get(Scene, turn.scene_id) if turn.scene_id else None
     planning = await generation_context(db, chapter, None)
@@ -37,68 +38,19 @@ async def capture_context(db, chapter, turn, start, end):
                 "is_archived",
             )
         }
-        planning["characters"] = list(
-            (
-                await db.scalars(
-                    select(Character)
-                    .join(SceneCharacter, SceneCharacter.character_id == Character.id)
-                    .join(StoryCharacter, StoryCharacter.character_id == Character.id)
-                    .where(
-                        SceneCharacter.scene_id == scene.id,
-                        StoryCharacter.story_id == chapter.story_id,
-                        Character.is_archived.is_(False),
-                    )
-                    .order_by(Character.id)
-                )
-            ).all()
-        )
-    # Match normal generation's active chapter cast unless a scene supplies its own.
+        planning["characters"] = await scene_cast(db, chapter.story_id, scene.id)
     cast = planning["characters"]
     if cast is None:
-        from app.chapters.models import ChapterCharacter
-
-        cast = list(
-            (
-                await db.scalars(
-                    select(Character)
-                    .join(
-                        ChapterCharacter, ChapterCharacter.character_id == Character.id
-                    )
-                    .where(
-                        ChapterCharacter.chapter_id == chapter.id,
-                        Character.user_id == story.user_id,
-                        Character.is_archived.is_(False),
-                    )
-                    .order_by(Character.id)
-                    .limit(51)
-                )
-            ).all()
-        )
+        cast = await chapter_cast(db, chapter.id, limit=51)
     cast = sorted(cast, key=lambda c: str(c.id))
     if len(cast) > 50:
-        from fastapi import HTTPException
 
-        raise HTTPException(
+        raise DomainError(
             422,
             "Rewrite context supports up to 50 active characters. Reduce the chapter or scene cast.",
         )
     ids = [c.id for c in cast]
-    relations = (
-        list(
-            (
-                await db.scalars(
-                    select(CharacterRelationship)
-                    .where(
-                        CharacterRelationship.character_id.in_(ids),
-                        CharacterRelationship.related_character_id.in_(ids),
-                    )
-                    .order_by(CharacterRelationship.id)
-                )
-            ).all()
-        )
-        if ids
-        else []
-    )
+    relations = await cast_relationships(db, ids)
     before = list(
         (
             await db.scalars(
@@ -194,9 +146,8 @@ async def capture_context(db, chapter, turn, start, end):
         "after": (turn.content[end:] + "\n\n" + "\n\n".join(after))[:4000],
     }
     if len(json.dumps(context, default=str)) > 60000:
-        from fastapi import HTTPException
 
-        raise HTTPException(
+        raise DomainError(
             422,
             "Rewrite context is too large. Reduce the active cast or character details.",
         )

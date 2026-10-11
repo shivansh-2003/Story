@@ -5,15 +5,17 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.auth import router as auth
 from app.chapters import router as chapters
 from app.characters import router as characters
 from app.core.logging_config import setup_logging
 from app.database import engine
-from pathlib import Path
-from alembic.config import Config
-from alembic.script import ScriptDirectory
+from app.core.schema import check_schema_revision
+from app.core.llm_client import close_model_clients
+from app.core.redis_client import close_redis_client
+from app.core.errors import DomainError
 from app.generation import router as generation
 from app.stories import router as stories
 from app.transfers import router as transfers
@@ -22,7 +24,6 @@ from app.rewriting import router as rewriting
 from app.transfers.upload_limit import ImportUploadLimit
 from app.manuscript import router as manuscript
 from app.jobs.worker import run_worker
-from sqlalchemy import text
 
 setup_logging()
 logger = logging.getLogger("story_assistant")
@@ -33,23 +34,29 @@ ALLOWED_ORIGINS = ["http://localhost:5173", "http://localhost:4173"]
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Never partially change an existing schema on boot. Migrate explicitly first.
-    async with engine.connect() as conn:
-        try:
-            revision = await conn.scalar(text("SELECT version_num FROM alembic_version"))
-        except Exception as error:
-            raise RuntimeError("Database migrations required. See phase/phase1.md before starting the server.") from error
-        expected_revision = ScriptDirectory.from_config(Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))).get_current_head()
-        if revision != expected_revision:
-            raise RuntimeError("Run alembic upgrade head before starting the server.")
-    worker = asyncio.create_task(run_worker())
+    worker = None
     try:
+        async with engine.connect() as conn:
+            await check_schema_revision(conn)
+        worker = asyncio.create_task(run_worker())
         yield
     finally:
-        worker.cancel()
-        await asyncio.gather(worker, return_exceptions=True)
+        if worker is not None:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+        try:
+            await close_model_clients()
+            await close_redis_client()
+        finally:
+            await engine.dispose()
 
 
 app = FastAPI(title="Story Assistant API", lifespan=lifespan)
+
+
+@app.exception_handler(DomainError)
+async def domain_error_response(request: Request, error: DomainError):
+    return JSONResponse(status_code=error.status_code, content={"detail": error.detail})
 
 app.add_middleware(
     CORSMiddleware,

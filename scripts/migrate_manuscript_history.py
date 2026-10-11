@@ -1,6 +1,6 @@
 """Upgrade an existing Story database atomically, preserving a local manuscript snapshot.
 
-Stop the backend first. Run: PYTHONPATH=. venv/bin/python scripts/migrate_phase1.py
+Stop the backend first. Run: PYTHONPATH=. venv/bin/python scripts/migrate_manuscript_history.py
 For a new empty database, use venv/bin/alembic upgrade head instead.
 """
 
@@ -26,7 +26,7 @@ def migrate(connection):
         else None
     )
     if revision in {"0002_phase1", "0003_phase2", "0004_phase3", "0005_phase4"}:
-        print("Phase 1 is already applied.")
+        print("Manuscript history migration is already applied.")
         return
     if revision not in (None, "0001_baseline"):
         raise RuntimeError("Unexpected migration revision; inspect before upgrading.")
@@ -81,7 +81,7 @@ def migrate(connection):
         str(row["id"]): row["content"] for row in turns
     }:
         raise RuntimeError("Manuscript verification failed; migration will roll back.")
-    print("Phase-1 schema and history applied; every accepted paragraph is unchanged.")
+    print("Manuscript schema and revision history applied; every accepted paragraph is unchanged.")
 
 
 async def main():

@@ -1,7 +1,8 @@
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, status
+from fastapi import APIRouter, status
 
+from app.core.access import get_owned_character
 from app.characters import service
 from app.characters.models import Character, CharacterRelationship
 from app.characters.schemas import (
@@ -11,7 +12,7 @@ from app.characters.schemas import (
     CharacterRelationshipRead,
     CharacterUpdate,
 )
-from app.core.deps import CurrentUser, DbSession, get_owned_character
+from app.core.deps import CurrentUser, DbSession
 
 router = APIRouter(prefix="/characters", tags=["characters"])
 
@@ -23,9 +24,9 @@ async def list_characters(db: DbSession, current_user: CurrentUser) -> list[Char
 
 @router.post("", response_model=CharacterRead, status_code=status.HTTP_201_CREATED)
 async def create_character(
-    body: CharacterCreate, db: DbSession, current_user: CurrentUser, background_tasks: BackgroundTasks
+    body: CharacterCreate, db: DbSession, current_user: CurrentUser
 ) -> Character:
-    return await service.create_character(db, current_user, body, background_tasks)
+    return await service.create_character(db, current_user, body)
 
 
 @router.get("/{character_id}", response_model=CharacterRead)
@@ -39,9 +40,8 @@ async def update_character(
     body: CharacterUpdate,
     db: DbSession,
     current_user: CurrentUser,
-    background_tasks: BackgroundTasks,
 ) -> Character:
-    return await service.update_character(db, current_user, character_id, body, background_tasks)
+    return await service.update_character(db, current_user, character_id, body)
 
 
 @router.delete("/{character_id}", status_code=status.HTTP_204_NO_CONTENT)

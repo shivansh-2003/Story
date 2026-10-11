@@ -1,9 +1,9 @@
 import asyncio
 import uuid
 
-from app.chapters.service import get_prior_chapter_summaries, list_active_characters
+from app.chapters.service import get_prior_chapter_summaries
 from app.characters.models import Character, CharacterRelationship
-from app.characters.service import list_relationships_among
+from app.characters.queries import chapter_cast, cast_relationships
 from app.core.logging_utils import log_execution
 from app.database import async_session
 from app.generation import semantic_search
@@ -14,33 +14,23 @@ MAX_PROMPT_TOKENS = 6000  # applies to the user message only — see _assemble_c
 MAX_RETRIEVED_TURNS_CHARS = 1500  # ceiling so one very long retrieved paragraph can't dominate
 
 
-@log_execution
-async def _fetch_story(story_id: uuid.UUID) -> Story:
+async def _prompt_sources(chapter_id, story_id, planning_context, *, include_memory):
+    # Serialize these short reads on one session; do not fan out one database
+    # connection per feature or interleave AsyncSession operations.
     async with async_session() as db:
-        return await db.get(Story, story_id)
-
-
-@log_execution
-async def _fetch_active_characters(chapter_id: uuid.UUID) -> list[Character]:
-    async with async_session() as db:
-        return await list_active_characters(db, chapter_id)
-
-
-@log_execution
-async def _fetch_prior_summaries(story_id: uuid.UUID, chapter_id: uuid.UUID) -> list[str]:
-    async with async_session() as db:
-        return await get_prior_chapter_summaries(db, story_id, chapter_id)
-
-
-@log_execution
-async def _fetch_relationships(character_ids: list[uuid.UUID]) -> list[CharacterRelationship]:
-    async with async_session() as db:
-        return await list_relationships_among(db, character_ids)
+        story = await db.get(Story, story_id)
+        characters = planning_context["characters"]
+        if characters is None:
+            characters = await chapter_cast(db, chapter_id)
+        relationships = await cast_relationships(db, [c.id for c in characters])
+        summaries = await get_prior_chapter_summaries(db, story_id, chapter_id) if include_memory else []
+        context = await accepted_context(chapter_id, db) if include_memory else None
+    return story, characters, relationships, summaries, context
 
 
 @log_execution
 async def _fetch_relevant_turns(story_id: uuid.UUID, chapter_id: uuid.UUID, instruction: str) -> list[str]:
-    """Independent of the other three gathered fetches — only needs the
+    """Independent of the other source reads — only needs the
     instruction text, already available as a function parameter. Returns []
     on any embedding failure (rate limit, timeout) rather than raising —
     retrieval is an enhancement, not a hard requirement for generation to
@@ -62,38 +52,18 @@ async def build_continue_prompt(
     length_words: int,
     planning_context: dict | None = None,
 ) -> tuple[str, str]:
-    """Used for: fresh generate, and regenerate-after-AI-draft (when pending_turn
-    either doesn't exist or was AI-sourced, not user-edited).
+    """Build continuation context with one source-read connection.
 
-    Returns (system, user). `system` — bible + characters + relationships — is
-    identical across every regenerate/edit within a chapter, so keeping it in
-    its own message lets a provider (or Ollama's own KV-cache) reuse that
-    prefix across a generate → regenerate → edit burst instead of re-sending
-    and re-evaluating it fresh every call.
-
-    story, active characters, prior-chapter summaries, and semantically
-    relevant past turns are four independent reads with no data dependency
-    between them, so they run concurrently — each on its own short-lived
-    session, since AsyncSession isn't safe for interleaved use from multiple
-    coroutines. relationships
-    genuinely depends on the character IDs from the characters fetch (it's
-    not independent — verified against the actual query before assuming
-    otherwise), so it runs after, not folded into the same gather()."""
+    Semantic retrieval runs concurrently, opening its own short read session
+    only after embedding completes. No shared session is used concurrently.
+    """
     planning_context = planning_context or {"text": "", "characters": None}
 
-    async def active_cast():
-        if planning_context["characters"] is not None:
-            return planning_context["characters"]
-        return await _fetch_active_characters(chapter_id)
-
-    story, characters, prior_chapter_summaries, relevant_turns, context = await asyncio.gather(
-        _fetch_story(story_id),
-        active_cast(),
-        _fetch_prior_summaries(story_id, chapter_id),
+    sources, relevant_turns = await asyncio.gather(
+        _prompt_sources(chapter_id, story_id, planning_context, include_memory=True),
         _fetch_relevant_turns(story_id, chapter_id, instruction),
-        accepted_context(chapter_id),
     )
-    relationships = await _fetch_relationships([c.id for c in characters])
+    story, characters, relationships, prior_chapter_summaries, context = sources
 
     session_state["manuscript_revision"] = context["manuscript_revision"]
 
@@ -128,20 +98,12 @@ async def build_edit_prompt(
     "never trim" content per _assemble_continue_user's ladder, so there's
     nothing left that budget enforcement would ever touch.
 
-    Same story/characters concurrency as build_continue_prompt — see there
-    for why relationships isn't folded into the same gather()."""
+    Source reads share one short-lived database session."""
     planning_context = planning_context or {"text": "", "characters": None}
 
-    async def active_cast():
-        if planning_context["characters"] is not None:
-            return planning_context["characters"]
-        return await _fetch_active_characters(chapter_id)
-
-    story, characters = await asyncio.gather(
-        _fetch_story(story_id),
-        active_cast(),
+    story, characters, relationships, _, _ = await _prompt_sources(
+        chapter_id, story_id, planning_context, include_memory=False
     )
-    relationships = await _fetch_relationships([c.id for c in characters])
     pending = session_state["pending_turn"]
     if pending is None:
         raise ValueError("No pending turn to edit")
@@ -275,6 +237,15 @@ def _format_characters(characters: list[Character]) -> str:
             line += f" ({c.role})"
         if c.condensed_summary:
             line += f": {c.condensed_summary}"
+        else:
+            # Fresh character facts remain available while the durable summary
+            # job is pending or failed; never fall back to an outdated summary.
+            facts = [c.appearance, c.voice_notes, c.motivation, c.flaw, c.backstory]
+            if c.personality_traits:
+                facts.insert(0, ", ".join(c.personality_traits))
+            fallback = "; ".join(str(value)[:300] for value in facts if value)
+            if fallback:
+                line += ": " + fallback
         lines.append(line)
     return "Characters in scene:\n" + "\n".join(lines)
 
